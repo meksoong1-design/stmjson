@@ -1,7 +1,7 @@
 # ============================================================
-# STM Document AI Bank Statement Parser v5 (API + Smart Regex)
+# STM Document AI Bank Statement Parser v6 (API + Number-First Logic)
 # ใช้ Document AI API อ่านไฟล์ PDF/Image
-# ดึงชื่อ/เลขบัญชีอัตโนมัติ, สกัดเงินเดือน, โบนัส, ตรวจสอบ Balance Chain
+# เน้นความถูกต้องของตัวเลข เดบิต เครดิต ยอดคงเหลือ 100% ด้วยสมการ Balance Chain
 # ============================================================
 
 import os
@@ -26,7 +26,7 @@ from openpyxl.styles import Alignment, Font, Border, Side, PatternFill
 # ============================================================
 # 0) PAGE CONFIG & CONSTANTS
 # ============================================================
-st.set_page_config(page_title="STM Document AI Parser v5", layout="centered")
+st.set_page_config(page_title="STM Document AI Parser v6", layout="centered")
 
 st.markdown("""
 <style>
@@ -40,17 +40,7 @@ div[data-testid="stFileUploader"] section { border-radius:10px; }
 </style>
 """, unsafe_allow_html=True)
 
-BALANCE_TOLERANCE = 0.05
 FORCE_YEAR = datetime.now().year
-
-BANK_LABELS = {
-    "AUTO":     "ตรวจจับอัตโนมัติ",
-    "KBANK":    "กสิกรไทย (KBANK)",
-    "BBL":      "กรุงเทพ (BBL)",
-    "SCB":      "ไทยพาณิชย์ (SCB)",
-    "KRUNGSRI": "กรุงศรี (Krungsri)",
-    "DEFAULT":  "ไม่ระบุ / อื่นๆ",
-}
 
 # ============================================================
 # 1) LOGIN
@@ -162,13 +152,9 @@ def extract_time(text):
     return m.group(0) if m else ""
 
 # ============================================================
-# 4) SMART PARSER (LINE REBUILDING)
+# 4) SMART PARSER (NUMBER-FIRST LOGIC)
 # ============================================================
 def rebuild_lines_from_json(doc_dict, full_text):
-    """
-    จัดกลุ่มข้อความให้อยู่ในบรรทัดเดียวกัน โดยอิงจากค่าพิกัดแกน Y 
-    วิธีนี้แก้ปัญหา Document AI ไม่ยอมจัดตารางให้ (เช่นของ SCB)
-    """
     pages = doc_dict.get("pages", [])
     all_lines = []
     
@@ -189,34 +175,37 @@ def rebuild_lines_from_json(doc_dict, full_text):
             if token_text:
                 tokens_info.append({"text": token_text, "x": x_center, "y": y_center})
                 
-        # จัดเรียงตามแกน Y และจัดกลุ่มถ้าระยะ Y ห่างกันไม่เกิน 1% (0.01)
         tokens_info = sorted(tokens_info, key=lambda k: k["y"])
+        lines = []
         current_line = []
         current_y = None
+        
+        # ปรับ Y_TOLERANCE ให้กว้างขึ้นเพื่อแก้ภาพเอียง
+        Y_TOLERANCE = 0.02 
         
         for tok in tokens_info:
             if current_y is None:
                 current_line.append(tok)
                 current_y = tok["y"]
-            elif abs(tok["y"] - current_y) < 0.01: # 1% threshold
+            elif abs(tok["y"] - current_y) <= Y_TOLERANCE:
                 current_line.append(tok)
+                current_y = sum([t["y"] for t in current_line]) / len(current_line)
             else:
-                # รวมบรรทัดและเก็บเข้า list (จัดเรียงตามแกน X จากซ้ายไปขวา)
-                current_line = sorted(current_line, key=lambda k: k["x"])
-                line_text = " ".join([t["text"] for t in current_line])
-                all_lines.append(line_text)
-                
+                lines.append(current_line)
                 current_line = [tok]
                 current_y = tok["y"]
                 
         if current_line:
-            current_line = sorted(current_line, key=lambda k: k["x"])
-            line_text = " ".join([t["text"] for t in current_line])
+            lines.append(current_line)
+            
+        for line_tokens in lines:
+            sorted_tokens = sorted(line_tokens, key=lambda k: k["x"])
+            line_text = " ".join([t["text"] for t in sorted_tokens])
             all_lines.append(line_text)
             
     return all_lines
 
-def parse_transactions(lines, bank_choice):
+def parse_transactions(lines):
     rows = []
     prev_balance = None
     
@@ -225,54 +214,51 @@ def parse_transactions(lines, bank_choice):
         time = extract_time(line)
         moneys = extract_money_values(line)
         
-        desc = line
-        for m in re.findall(r"-?\d{1,3}(?:,\d{3})+\.\d{2}|-?\d+\.\d{2}|\b\d{1,2}:\d{2}(?::\d{2})?\b|\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b", line):
-            desc = desc.replace(m, "")
-        desc = clean_text(desc)
-
-        # ถ้ายกยอดมา
         if any(kw in line.upper() for kw in ["ยอดยกมา", "BROUGHT FORWARD", "B/F"]):
-            if moneys:
-                prev_balance = moneys[-1]
+            if moneys: prev_balance = moneys[-1] 
             continue
             
-        if not date: continue
+        if not date or not moneys:
+            continue
 
         debit, credit, balance = 0.0, 0.0, 0.0
         
-        # ถอดรหัสจำนวนเงินจาก 2 ก้อน (ยอดเงิน และ ยอดคงเหลือ)
         if len(moneys) >= 2:
-            amount = moneys[-2]
-            balance = moneys[-1]
+            amount = moneys[-2]   
+            balance = moneys[-1]  
             
             if prev_balance is not None:
-                # คำนวณกระทบยอด Balance Chain
-                if abs(prev_balance - amount - balance) < 0.02:
-                    debit = amount
-                elif abs(prev_balance + amount - balance) < 0.02:
-                    credit = amount
+                if abs(prev_balance - amount - balance) < 0.05: debit = amount
+                elif abs(prev_balance + amount - balance) < 0.05: credit = amount
                 else:
-                    # ถ้าคำนวณไม่ลงตัว ให้เดาจากคำใน SCB, KBANK, BBL
-                    if any(kw in line.upper() for kw in ["X1", "ฝาก", "รับ", "DEPOSIT"]): credit = amount
-                    elif any(kw in line.upper() for kw in ["X2", "ถอน", "จ่าย", "WITHDRAWAL"]): debit = amount
-                    elif balance < prev_balance: debit = amount
+                    if balance < prev_balance: debit = amount
                     else: credit = amount
             else:
-                # ไม่มี prev_balance ให้เดาจาก Keyword
                 if any(kw in line.upper() for kw in ["X1", "ฝาก", "รับ", "DEPOSIT"]): credit = amount
                 elif any(kw in line.upper() for kw in ["X2", "ถอน", "จ่าย", "WITHDRAWAL"]): debit = amount
-                else: debit = amount # Default if unknown
-
+                else: debit = amount 
             prev_balance = balance
             
         elif len(moneys) == 1:
-            # มีก้อนเดียว เดาว่าเป็นยอดรวม หรือยอดคงเหลือ
-            balance = moneys[0]
-            prev_balance = balance
+            amount = moneys[0]
+            if "X1" in line.upper() or "ฝาก" in line:
+                credit = amount
+                if prev_balance is not None: balance = prev_balance + credit
+            elif "X2" in line.upper() or "ถอน" in line:
+                debit = amount
+                if prev_balance is not None: balance = prev_balance - debit
+            else:
+                debit = amount 
+            if balance > 0: prev_balance = balance
+
+        desc = line
+        for m in re.findall(r'-?\d{1,3}(?:,\d{3})*\.\d{2}|-?\d+\.\d{2}|\b\d{1,2}:\d{2}(?::\d{2})?\b|\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b', line):
+            desc = desc.replace(m, "")
+        desc = re.sub(r'\s+', ' ', desc).strip()
 
         rows.append({
             "วันที่เดือนปี": date, "เวลา": time,
-            "รายการ": desc[:60], "รายละเอียด": desc,
+            "รายการ": desc[:40], "รายละเอียด": desc,
             "เดบิต": debit, "เครดิต": credit, "ยอดคงเหลือ": balance,
             "ช่องทาง": "Document AI"
         })
@@ -312,7 +298,7 @@ def detect_salary(df_txn):
             rows.append({"กลุ่ม":"เงินเดือน","วันที่":row["วันที่เดือนปี"],"จำนวนเงิน":cr})
     return pd.DataFrame(rows)
 
-def build_summary_df(df_txn, owner, acc_no, bank_name):
+def build_summary_df(df_txn, owner, acc_no):
     if df_txn.empty:
         last_bal, s_date, e_date = 0.0, "", ""
     else:
@@ -324,7 +310,6 @@ def build_summary_df(df_txn, owner, acc_no, bank_name):
     rows = [
         {"รายการ":"เจ้าของบัญชี",        "ข้อมูล": owner},
         {"รายการ":"เลขที่บัญชีเงินฝาก",  "ข้อมูล": acc_no},
-        {"รายการ":"ธนาคาร",               "ข้อมูล": bank_name},
         {"รายการ":"จำนวนรายการ",          "ข้อมูล": len(df_txn)},
         {"รายการ":"รวมเดบิต",             "ข้อมูล": float(df_txn["เดบิต"].sum()) if not df_txn.empty else 0.0},
         {"รายการ":"รวมเครดิต",            "ข้อมูล": float(df_txn["เครดิต"].sum()) if not df_txn.empty else 0.0},
@@ -392,7 +377,7 @@ def calculate_30day_blocks(df_txn, period_days=30, periods=3):
                        "data":blk})
     return {"daily":daily,"blocks":blocks}
 
-def add_bank_statement_sheet(path, df_txn, owner, acc_no, bank_name):
+def add_bank_statement_sheet(path, df_txn, owner, acc_no):
     result = calculate_30day_blocks(df_txn)
     blocks = result["blocks"]
     wb = load_workbook(path)
@@ -419,7 +404,7 @@ def add_bank_statement_sheet(path, df_txn, owner, acc_no, bank_name):
     ws.cell(4,5,"ประเมินวงเงินได้"); ws.cell(4,6,"=ROUND(F2*G3*G4,2)")
     ws.merge_cells("H2:I2"); ws["H2"]="Account Detail"
     ws.cell(3,8,"ธนาคาร"); ws.cell(3,9,"เลขที่บัญชี")
-    ws.cell(4,8,bank_name); ws.cell(4,9,acc_no)
+    ws.cell(4,8,"AUTO"); ws.cell(4,9,acc_no)
     
     for r in range(2,5):
         for c in range(1,10):
@@ -517,16 +502,16 @@ def format_summary_sheet(ws):
         if isinstance(ws.cell(r,2).value,(int,float)):
             ws.cell(r,2).number_format="#,##0.00"
 
-def build_output_excel(df_account, df_txn, owner, acc_no, bank_name):
+def build_output_excel(df_account, df_txn, owner, acc_no):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
         tmp_path = tmp.name
 
     with pd.ExcelWriter(tmp_path, engine="openpyxl") as writer:
         df_account.to_excel(writer, sheet_name="เจ้าของบัญชี", index=False)
         df_txn.to_excel(writer, sheet_name="รายละเอียด เดบิต-เครดิต", index=False)
-        build_summary_df(df_txn, owner, acc_no, bank_name).to_excel(writer, sheet_name="สรุปยอด", index=False)
+        build_summary_df(df_txn, owner, acc_no).to_excel(writer, sheet_name="สรุปยอด", index=False)
 
-    add_bank_statement_sheet(tmp_path, df_txn, owner, acc_no, bank_name)
+    add_bank_statement_sheet(tmp_path, df_txn, owner, acc_no)
 
     wb = load_workbook(tmp_path)
     for ws in wb.worksheets:
@@ -542,22 +527,18 @@ def build_output_excel(df_account, df_txn, owner, acc_no, bank_name):
 # ============================================================
 # 7) MAIN PIPELINE PROCESSOR
 # ============================================================
-def process_one_file(file_bytes, filename, selected_bank):
-    # 1. ส่งไฟล์ให้ API
+def process_one_file(file_bytes, filename):
     doc_dict, raw_text = call_document_ai(file_bytes, filename)
     if not raw_text.strip():
         raise ValueError("Document AI อ่านข้อความไม่เจอ กรุณาตรวจสอบไฟล์")
 
-    # 2. ค้นหาชื่อและเลขบัญชีอัตโนมัติ
     owner, acc_no = extract_account_info(raw_text)
-    
-    # 3. ตรวจจับและจัดกลุ่มบรรทัดข้อความจาก JSON Bounding Boxes
     lines = rebuild_lines_from_json(doc_dict, raw_text)
+    df_txn = parse_transactions(lines)
     
-    # 4. แปลงบรรทัดเป็น DataFrame ผ่าน Regex ของเงินเข้า/ออก
-    df_txn = parse_transactions(lines, selected_bank)
-    df_txn["ไฟล์ต้นฉบับ"] = filename
-    
+    if not df_txn.empty:
+        df_txn["ไฟล์ต้นฉบับ"] = filename
+
     return {
         "df_txn": df_txn,
         "owner": owner, 
@@ -570,8 +551,8 @@ def process_one_file(file_bytes, filename, selected_bank):
 if not st.session_state.authenticated:
     login_page()
 
-st.title("STM Document AI Parser v5")
-st.caption("เชื่อม API | อ่านโครงสร้างตารางอัจฉริยะ (SCB, BBL, KBANK) | แยกเงินเดือนอัตโนมัติ")
+st.title("STM Document AI Parser v6")
+st.caption("เชื่อม API | อ่านตัวเลขแม่นยำสูง (Balance Chain) แก้ปัญหาภาพเอียง | ทำ Excel อัตโนมัติ")
 st.divider()
 
 st.markdown('<div class="section-title"><span class="step-number">1</span><span>ตรวจสอบ / แก้ไขข้อมูลบัญชี</span></div>', unsafe_allow_html=True)
@@ -597,7 +578,7 @@ if process_clicked:
             status.info(f"API กำลังประมวลผลไฟล์ {idx}/{total}: {uf.name}")
             progress.progress(int((idx-1)/total*70))
             
-            res = process_one_file(uf.read(), uf.name, "AUTO")
+            res = process_one_file(uf.read(), uf.name)
 
             if not res["df_txn"].empty: 
                 all_txn.append(res["df_txn"])
@@ -622,16 +603,15 @@ if process_clicked:
 
         owner   = owner_input.strip() or auto_owner or "ไม่ระบุ"
         acc_no  = acc_input.strip()   or auto_acc   or "ไม่ระบุ"
-        bank_name = "AUTO"
-        df_account  = pd.DataFrame([{"เจ้าของบัญชี": owner, "เลขที่บัญชีเงินฝาก": acc_no, "ธนาคาร": bank_name}])
-
-        excel_bytes = build_output_excel(df_account, final_df, owner, acc_no, bank_name)
+        
+        df_account  = pd.DataFrame([{"เจ้าของบัญชี": owner, "เลขที่บัญชีเงินฝาก": acc_no, "ธนาคาร": "AUTO"}])
+        excel_bytes = build_output_excel(df_account, final_df, owner, acc_no)
         excel_name = f"Statement_{owner}.xlsx".replace("/","_").replace("\\","_")
 
         st.session_state.results = {
             "df": final_df,
             "excel": excel_bytes, "excel_name": excel_name,
-            "owner": owner, "acc_no": acc_no, "bank_name": bank_name,
+            "owner": owner, "acc_no": acc_no,
         }
         progress.progress(100, text="เสร็จสิ้น ✅")
         status.success(f"ประมวลผลสำเร็จ พบ {len(final_df):,} รายการ")
@@ -654,7 +634,7 @@ if st.session_state.get("results"):
     m4.metric("รวมเครดิต",    f"{credit_sum:,.2f}")
 
     st.download_button(
-        "📥 ดาวน์โหลดไฟล์ Excel (ครบ 4 ชีท + สรุปยอดเงินเดือน)",
+        "📥 ดาวน์โหลดไฟล์ Excel (เน้นตัวเลข + สรุปยอดเงินเดือน)",
         data=res["excel"], file_name=res["excel_name"],
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True, type="primary"
