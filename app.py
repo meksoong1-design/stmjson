@@ -669,6 +669,16 @@ def process_document(doc_dict, full_text, bank, filename):
     # กรอง row ที่ไม่มีข้อมูลเลย
     all_rows = [r for r in all_rows if r.get("date") or is_valid_number(r.get("balance"))]
 
+    # เรียงลำดับตามวันที่ก่อน verify (รักษา original order ภายในวันเดียวกัน)
+    def _date_sort_key(r):
+        d = r.get("date", "")
+        try:
+            return datetime.strptime(d, "%d/%m/%Y") if d else datetime.max
+        except Exception:
+            return datetime.max
+
+    all_rows = sorted(all_rows, key=_date_sort_key)
+
     # ตรวจ balance chain
     verified = verify_and_fill_amounts(all_rows)
 
@@ -1069,6 +1079,13 @@ def main_app():
                           "ยอดคงเหลือ","รายละเอียด","ช่องทาง","source","ไฟล์ต้นฉบับ"]
             final_df = (pd.concat(all_txn, ignore_index=True)
                         if all_txn else pd.DataFrame(columns=EMPTY_COLS))
+            # เรียงลำดับวันที่ (กรณีอัปโหลดหลายไฟล์ / วันที่ปนกัน)
+            if not final_df.empty and "วันที่เดือนปี" in final_df.columns:
+                def _parse_date_safe(d):
+                    try:   return datetime.strptime(str(d), "%d/%m/%Y")
+                    except: return datetime.max
+                final_df["_sort_date"] = final_df["วันที่เดือนปี"].apply(_parse_date_safe)
+                final_df = final_df.sort_values(["_sort_date", final_df.index.to_series()], kind="stable").drop(columns=["_sort_date"]).reset_index(drop=True)
             final_df["ลำดับ"] = range(1, len(final_df)+1)
             check_df = (pd.concat(all_check, ignore_index=True)
                         if all_check else pd.DataFrame())
