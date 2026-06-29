@@ -1,51 +1,18 @@
-# Python
+.streamlit/secrets.toml
 __pycache__/
-*.py[cod]
+*.pyc
 *.pyo
 *.pyd
-.Python
-
-# Virtual environment
-venv/
-.env/
-.venv/
-
-# Environment variables
 .env
 .env.*
-!.env.example
-
-# Streamlit secrets
-.streamlit/secrets.toml
-
-# Google service account keys
-*service-account*.json
-*credentials*.json
-*key*.json
-google-credentials.json
-gcp-credentials.json
-
-# Output files
+venv/
+.venv/
 *.xlsx
 *.xls
 *.csv
 document.json
-output.xlsx
-output_*.xlsx
-stm_result_*.xlsx
-stm_documentai_*.xlsx
-
-# Uploaded / temp files
-uploads/
-temp/
-tmp/
-*.tmp
-
-# OS / editor
+output*.xlsx
+*service-account*.json
+*credentials*.json
+*key*.json
 .DS_Store
-Thumbs.db
-.vscode/
-.idea/
-
-# Jupyter
-.ipynb_checkpoints/
