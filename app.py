@@ -792,7 +792,9 @@ def calculate_30day_blocks(df_txn, period_days=30, periods=3):
     work = work.dropna(subset=["_date"])
     if work.empty: return empty
     work["ยอดคงเหลือ"] = pd.to_numeric(work["ยอดคงเหลือ"], errors="coerce").fillna(0.0)
-    work = work.sort_values(["_date", work.index.name or work.index.to_list()[0] if len(work) else "_date"])
+    work = work.reset_index(drop=True)
+    work["_row_order"] = work.index
+    work = work.sort_values(["_date", "_row_order"])
     work["_day"] = work["_date"].dt.normalize()
     daily_txn = work.groupby("_day").agg(ยอดคงเหลือสิ้นวัน=("ยอดคงเหลือ","last")).sort_index()
     full_days = pd.date_range(start=daily_txn.index.min(), end=daily_txn.index.max(), freq="D")
