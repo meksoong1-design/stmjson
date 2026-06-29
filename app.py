@@ -1,7 +1,7 @@
 # ============================================================
-# JSON Bank Statement Parser - Streamlit Edition
+# JSON Bank Statement Parser - Streamlit Edition (Full Version)
 # รองรับการอัปโหลดไฟล์ document.json จาก Document AI / OCR
-# สร้าง Excel: เจ้าของบัญชี, รายละเอียด เดบิต-เครดิต, สรุปยอด, BANK STATEMENT 1
+# ระบบอัตโนมัติ: ดึงชื่อ/เลขบัญชี, แยกเดบิต/เครดิต, หาเงินเดือน
 # ============================================================
 
 import streamlit as st
@@ -37,7 +37,6 @@ def auto_fit_worksheet(ws):
     ws.freeze_panes = "A2"
     thin = Side(style="thin", color="D9D9D9")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
-
     headers = {c: clean_text(ws.cell(row=1, column=c).value) for c in range(1, ws.max_column + 1)}
 
     for row in ws.iter_rows():
@@ -85,7 +84,6 @@ def format_summary_sheet(ws):
     for row_idx in range(2, ws.max_row + 1):
         label = clean_text(ws.cell(row=row_idx, column=1).value)
         value_cell = ws.cell(row=row_idx, column=2)
-
         for col in range(1, 3):
             cell = ws.cell(row=row_idx, column=col)
             cell.border, cell.alignment = border, Alignment(vertical="center", wrap_text=False)
@@ -102,7 +100,7 @@ def format_summary_sheet(ws):
             ws.row_dimensions[row_idx].height = 22
             continue
 
-        if any(k in label for k in ["สถานะ", "จำนวนรายการ", "ยอดรวม", "ค่าเฉลี่ยล่าสุด 2 เดือน", "เดือนที่ใช้คำนวณ"]):
+        if any(k in label for k in ["สถานะ", "จำนวนรายการ", "ยอดรวม", "ค่าเฉลี่ยต่อเดือน", "เดือนที่ใช้คำนวณ"]):
             ws.cell(row=row_idx, column=1).fill = ws.cell(row=row_idx, column=2).fill = sub_fill
             ws.cell(row=row_idx, column=1).font = Font(bold=True)
 
@@ -122,8 +120,29 @@ def format_workbook_no_color(path):
     wb.save(path)
 
 # ============================================================
-# 2. DATA SUMMARY LOGIC
+# 2. SALARY DETECTION & SUMMARY LOGIC
 # ============================================================
+def detect_salary_from_df(df_txn):
+    if df_txn.empty: return pd.DataFrame()
+    
+    salary_kws = ["SALARY", "PAYROLL", "SALA", "PAYR", "เงินเดือน", "เงินเดือนหลัก", "SAL"]
+    bonus_kws = ["BONUS", "INCENTIVE", "COMMISSION", "โบนัส", "อินเซนทีฟ", "ค่าคอม"]
+    income_records = []
+    
+    for _, row in df_txn.iterrows():
+        credit = float(row.get("เครดิต", 0))
+        if credit > 0:
+            desc = str(row.get("รายละเอียด", "")).upper()
+            is_bonus = any(kw in desc for kw in bonus_kws)
+            is_salary = any(kw in desc for kw in salary_kws)
+            
+            if is_bonus:
+                income_records.append({"กลุ่ม": "รายได้พิเศษ/โบนัส", "วันที่": row["วันที่เดือนปี"], "จำนวนเงิน": credit})
+            elif is_salary:
+                income_records.append({"กลุ่ม": "เงินเดือน", "วันที่": row["วันที่เดือนปี"], "จำนวนเงิน": credit})
+                
+    return pd.DataFrame(income_records)
+
 def build_summary_df(df_txn, owner, acc_no, bank_name="JSON Data"):
     if df_txn.empty:
         last_bal, s_date, e_date = 0.0, "", ""
@@ -143,11 +162,32 @@ def build_summary_df(df_txn, owner, acc_no, bank_name="JSON Data"):
         {"รายการ": "ยอดคงเหลือล่าสุด", "ข้อมูล": last_bal},
         {"รายการ": "วันที่เริ่มต้น", "ข้อมูล": s_date},
         {"รายการ": "วันที่สิ้นสุด", "ข้อมูล": e_date},
-        {"รายการ": "หมวดหมู่รายได้", "ข้อมูล": "เงินเดือน"},
-        {"รายการ": "เงินเดือน - สถานะ", "ข้อมูล": "ไม่พบการประมวลผล (JSON)"},
-        {"รายการ": "", "ข้อมูล": ""},
-        {"รายการ": "สร้างไฟล์เมื่อ", "ข้อมูล": datetime.now().strftime("%d/%m/%Y %H:%M:%S")},
     ]
+
+    df_income = detect_salary_from_df(df_txn)
+    for group_name in ["เงินเดือน", "รายได้พิเศษ/โบนัส"]:
+        rows.append({"รายการ": "หมวดหมู่รายได้", "ข้อมูล": group_name})
+        if not df_income.empty and group_name in df_income["กลุ่ม"].values:
+            group_data = df_income[df_income["กลุ่ม"] == group_name].copy()
+            total_amt = float(group_data["จำนวนเงิน"].sum())
+            rows.extend([
+                {"รายการ": f"{group_name} - สถานะ", "ข้อมูล": "พบ"},
+                {"รายการ": f"{group_name} - จำนวนรายการ", "ข้อมูล": len(group_data)},
+                {"รายการ": f"{group_name} - ยอดรวม", "ข้อมูล": total_amt},
+                {"รายการ": f"{group_name} - ค่าเฉลี่ยต่อเดือน", "ข้อมูล": total_amt / len(group_data)},
+            ])
+            for idx, r in enumerate(group_data.itertuples(), start=1):
+                rows.append({"รายการ": f"{group_name} - รายการที่ {idx}", "ข้อมูล": r.วันที่})
+                rows.append({"รายการ": f"{group_name} - ยอด", "ข้อมูล": r.จำนวนเงิน})
+        else:
+            rows.extend([
+                {"รายการ": f"{group_name} - สถานะ", "ข้อมูล": "ไม่พบ"},
+                {"รายการ": f"{group_name} - จำนวนรายการ", "ข้อมูล": 0},
+                {"รายการ": f"{group_name} - ยอดรวม", "ข้อมูล": 0.0},
+            ])
+        rows.append({"รายการ": "", "ข้อมูล": ""})
+
+    rows.append({"รายการ": "สร้างไฟล์เมื่อ", "ข้อมูล": datetime.now().strftime("%d/%m/%Y %H:%M:%S")})
     return pd.DataFrame(rows)
 
 # ============================================================
@@ -181,8 +221,7 @@ def calculate_30day_statement_logic(df_txn, period_days=30, periods=3):
     for block_no in range(1, periods + 1):
         block = daily[daily["ช่วงที่"] == block_no].copy()
         blocks.append({
-            "ช่วงที่": block_no,
-            "จำนวนวัน": len(block),
+            "ช่วงที่": block_no, "จำนวนวัน": len(block),
             "ผลรวม": float(block["ยอดคงเหลือสิ้นวัน"].sum()) if len(block) else 0.0,
             "ค่าเฉลี่ย": float(block["ยอดคงเหลือสิ้นวัน"].mean()) if len(block) else 0.0,
             "data": block,
@@ -195,7 +234,6 @@ def calculate_30day_statement_logic(df_txn, period_days=30, periods=3):
 def add_bank_statement_logic_sheet(path, df_txn, owner, acc_no, bank_name="JSON Data"):
     result = calculate_30day_statement_logic(df_txn)
     blocks = result["blocks"]
-
     wb = load_workbook(path)
     ws = wb.create_sheet("BANK STATEMENT 1")
 
@@ -205,13 +243,9 @@ def add_bank_statement_logic_sheet(path, df_txn, owner, acc_no, bank_name="JSON 
     yellow = PatternFill("solid", fgColor="FFFF00")
     gray = PatternFill("solid", fgColor="D9D9D9")
     
-    thin_black = Side(style="thin", color="000000")
-    medium_black = Side(style="medium", color="000000")
-    thin_gray = Side(style="thin", color="D9D9D9")
-    
-    normal_border = Border(left=thin_black, right=thin_black, top=thin_black, bottom=thin_black)
-    heavy_border = Border(left=medium_black, right=medium_black, top=medium_black, bottom=medium_black)
-    data_border = Border(left=thin_gray, right=thin_gray, top=thin_gray, bottom=thin_gray)
+    normal_border = Border(left=Side(style="thin", color="000000"), right=Side(style="thin", color="000000"), top=Side(style="thin", color="000000"), bottom=Side(style="thin", color="000000"))
+    heavy_border = Border(left=Side(style="medium", color="000000"), right=Side(style="medium", color="000000"), top=Side(style="medium", color="000000"), bottom=Side(style="medium", color="000000"))
+    data_border = Border(left=Side(style="thin", color="D9D9D9"), right=Side(style="thin", color="D9D9D9"), top=Side(style="thin", color="D9D9D9"), bottom=Side(style="thin", color="D9D9D9"))
 
     ws.merge_cells("A1:I1")
     ws["A1"] = "BANK STATEMENT 1"
@@ -265,14 +299,11 @@ def add_bank_statement_logic_sheet(path, df_txn, owner, acc_no, bank_name="JSON 
                 date_val = row.get("วันที่", "")
                 if hasattr(date_val, "to_pydatetime"): date_val = date_val.to_pydatetime()
                 amt_val = float(row.get("ยอดคงเหลือสิ้นวัน", 0))
-                
                 ws.cell(row=excel_row, column=date_col, value=date_val)
                 ws.cell(row=excel_row, column=amount_col, value=amt_val)
-
                 if i > 1 and round(amt_val, 2) != round(float(data.iloc[i - 2].get("ยอดคงเหลือสิ้นวัน", 0)), 2):
                     ws.cell(row=excel_row, column=date_col).fill = yellow
                     ws.cell(row=excel_row, column=amount_col).fill = yellow
-
             for col in [n_col, date_col, amount_col]:
                 cell = ws.cell(row=excel_row, column=col)
                 cell.border, cell.alignment = data_border, Alignment(horizontal="center" if col != amount_col else "right", vertical="center")
@@ -285,13 +316,11 @@ def add_bank_statement_logic_sheet(path, df_txn, owner, acc_no, bank_name="JSON 
         ws.cell(row=37, column=amount_col, value=f"=IF({amt_let}39=0,0,{amt_let}36/{amt_let}39)")
         ws.cell(row=38, column=amount_col, value="จำนวนวัน")
         ws.cell(row=39, column=amount_col, value=f"=COUNT({amt_let}6:{amt_let}35)")
-
         for row in range(36, 40):
             for col in [n_col, date_col, amount_col]:
                 cell = ws.cell(row=row, column=col)
                 cell.border, cell.alignment = heavy_border, Alignment(horizontal="center" if col != amount_col else "right", vertical="center")
                 if col == amount_col: cell.number_format = "#,##0.00"
-        
         ws.cell(row=38, column=amount_col).fill = gray
         ws.cell(row=38, column=amount_col).font = Font(bold=True)
 
@@ -300,12 +329,33 @@ def add_bank_statement_logic_sheet(path, df_txn, owner, acc_no, bank_name="JSON 
     for letter, width in {"A": 5, "B": 14, "C": 16, "D": 5, "E": 14, "F": 16, "G": 5, "H": 14, "I": 16}.items():
         ws.column_dimensions[letter].width = width
     for addr in ["C2", "C3", "C4", "F2", "F3", "F4"]: ws[addr].number_format = "#,##0.00"
-    
     wb.save(path)
 
 # ============================================================
 # 4. JSON PARSER LOGIC
 # ============================================================
+def extract_account_info_from_json(lines):
+    owner_name, account_no = "", ""
+    for i, line in enumerate(lines[:30]):
+        line = line.strip()
+        if not line: continue
+        
+        # 1. ค้นหา "ชื่อบัญชี"
+        if not owner_name:
+            if re.search(r'(ชื่อบัญชี|Account Name|ชื่อ\s*-\s*นามสกุล)', line, re.IGNORECASE):
+                owner_name = re.sub(r'^(.*?)(ชื่อบัญชี|Account\s*Name|ชื่อ\s*-\s*นามสกุล)\s*[:：]?\s*', '', line, flags=re.IGNORECASE).strip()
+                if not owner_name and i + 1 < len(lines):
+                    owner_name = lines[i+1].strip()
+            elif re.match(r'^(นาย|นาง|น\.ส\.|นางสาว|MR\.|MRS\.|MS\.)\s+', line, re.IGNORECASE):
+                owner_name = line
+                
+        # 2. ค้นหา "เลขที่บัญชี"
+        if not account_no:
+            m = re.search(r'(\d{3}[- ]?\d{1}[- ]?\d{5}[- ]?\d{1}|\d{10,12})', line)
+            if m: account_no = m.group(1).replace(" ", "")
+
+    return owner_name if owner_name else "ไม่ระบุ", account_no if account_no else "ไม่ระบุ"
+
 def parse_json_to_df(json_bytes, filename):
     data = json.loads(json_bytes.decode('utf-8'))
     text = data.get('text', '')
@@ -322,8 +372,7 @@ def parse_json_to_df(json_bytes, filename):
         if not line: continue
         
         if date_pattern.match(line):
-            if current_tx:
-                transactions.append(current_tx)
+            if current_tx: transactions.append(current_tx)
             current_tx = {'date': line, 'money_tokens': [], 'raw_text': []}
         elif current_tx is not None:
             current_tx['raw_text'].append(line)
@@ -331,8 +380,7 @@ def parse_json_to_df(json_bytes, filename):
             for m in moneys:
                 current_tx['money_tokens'].append(float(m.replace(',', '')))
 
-    if current_tx:
-        transactions.append(current_tx)
+    if current_tx: transactions.append(current_tx)
 
     results = []
     prev_balance = None
@@ -342,10 +390,8 @@ def parse_json_to_df(json_bytes, filename):
         date = tx['date']
         tokens = tx['money_tokens']
         raw_lines = " ".join(tx['raw_text'])
-        
         debit, credit, balance = 0.0, 0.0, 0.0
         
-        # ตรรกะดึงยอดคงเหลือ
         if len(tokens) == 1:
             balance = tokens[0]
             prev_balance = balance
@@ -353,35 +399,24 @@ def parse_json_to_df(json_bytes, filename):
             amount = tokens[0]
             balance = tokens[-1]
             if prev_balance is not None:
-                if abs(prev_balance - amount - balance) < 0.01:
-                    debit = amount
-                elif abs(prev_balance + amount - balance) < 0.01:
-                    credit = amount
+                if abs(prev_balance - amount - balance) < 0.01: debit = amount
+                elif abs(prev_balance + amount - balance) < 0.01: credit = amount
                 else:
                     if balance < prev_balance: debit = amount
                     else: credit = amount
             prev_balance = balance
 
-        # จัดการคำอธิบายรายการ (ลบตัวเลขเงินออกเพื่อไม่ให้รก)
         desc = raw_lines
         for m in money_pattern.findall(raw_lines):
             desc = desc.replace(m, "")
         desc = re.sub(r'\s+', ' ', desc).strip()
-
         date_str = date.replace("-", "/")
 
         results.append({
-            "ลำดับ": seq,
-            "วันที่เดือนปี": date_str,
-            "เวลา": "",
-            "รายการ": desc[:50],
-            "เดบิต": debit if debit else 0.0,
-            "เครดิต": credit if credit else 0.0,
-            "ยอดคงเหลือ": balance if balance else 0.0,
-            "รายละเอียด": desc,
-            "ช่องทาง": "JSON",
-            "หน้า": 1,
-            "ไฟล์ต้นฉบับ": filename
+            "ลำดับ": seq, "วันที่เดือนปี": date_str, "เวลา": "", "รายการ": desc[:50],
+            "เดบิต": debit if debit else 0.0, "เครดิต": credit if credit else 0.0,
+            "ยอดคงเหลือ": balance if balance else 0.0, "รายละเอียด": desc,
+            "ช่องทาง": "JSON Upload", "หน้า": 1, "ไฟล์ต้นฉบับ": filename
         })
         seq += 1
 
@@ -416,14 +451,8 @@ st.markdown("""
 <style>
     .block-container { padding-top: 2rem; max-width: 980px; }
     h1 { font-size: 2.4rem !important; font-weight: 800 !important; }
-    .section-title {
-        display: flex; align-items: center; gap: 8px; font-weight: 800; font-size: 1.15rem;
-        margin: 18px 0 10px 0;
-    }
-    .section-title .step-number {
-        display: inline-flex; align-items: center; justify-content: center;
-        min-width: 30px; height: 30px; border-radius: 999px; background: #4c82fb; color: #ffffff;
-    }
+    .section-title { display: flex; align-items: center; gap: 8px; font-weight: 800; font-size: 1.15rem; margin: 18px 0 10px 0; }
+    .section-title .step-number { display: inline-flex; align-items: center; justify-content: center; min-width: 30px; height: 30px; border-radius: 999px; background: #4c82fb; color: #ffffff; }
     div[data-testid="stFileUploader"] section { border-radius: 10px; }
     div[data-testid="stButton"] button { border-radius: 10px; font-weight: 700; }
     div[data-testid="stDownloadButton"] button { border-radius: 10px; font-weight: 800; }
@@ -431,13 +460,14 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("JSON Bank Statement Parser")
-st.caption("แปลงไฟล์ JSON (จาก Document AI / OCR) ให้อยู่ในฟอร์แมต Excel ครบทุกชีทแบบอัตโนมัติ")
+st.caption("ดึงข้อมูลจากไฟล์ JSON อัตโนมัติ (ชื่อบัญชี, เงินเดือน, ธุรกรรม) พร้อมสร้าง Excel 4 ชีท")
 st.divider()
 
-st.markdown("""<div class="section-title"><span class="step-number">1</span><span class="step-text">ตั้งค่าข้อมูลบัญชี</span></div>""", unsafe_allow_html=True)
+st.markdown("""<div class="section-title"><span class="step-number">1</span><span class="step-text">ตรวจสอบ / แก้ไขข้อมูลบัญชี (ถ้าต้องการ)</span></div>""", unsafe_allow_html=True)
+st.info("💡 ระบบจะพยายามค้นหา ชื่อ และ เลขบัญชี ให้อัตโนมัติ แต่คุณสามารถกรอกดักไว้ก่อนได้")
 col1, col2 = st.columns(2)
-owner_name = col1.text_input("ชื่อเจ้าของบัญชี", placeholder="เช่น นาย สมชาย ใจดี", value="ไม่ระบุ")
-account_no = col2.text_input("เลขที่บัญชี", placeholder="เช่น 123-4-56789-0", value="ไม่ระบุ")
+owner_name = col1.text_input("ชื่อเจ้าของบัญชี", placeholder="เว้นว่างไว้เพื่อให้ระบบหาอัตโนมัติ", value="")
+account_no = col2.text_input("เลขที่บัญชี", placeholder="เว้นว่างไว้เพื่อให้ระบบหาอัตโนมัติ", value="")
 
 st.markdown("""<div class="section-title"><span class="step-number">2</span><span class="step-text">อัปโหลดไฟล์ JSON</span></div>""", unsafe_allow_html=True)
 uploaded_files = st.file_uploader("เลือกไฟล์ .json (อัปโหลดหลายไฟล์ได้)", type=["json"], accept_multiple_files=True)
@@ -451,9 +481,22 @@ if process_btn:
         st.stop()
         
     all_df = []
+    auto_owner = ""
+    auto_acc_no = ""
+    
     for f in uploaded_files:
         try:
-            df_part = parse_json_to_df(f.read(), f.name)
+            json_bytes = f.read()
+            # 1. ให้ระบบลองค้นหาชื่อบัญชีและเลขบัญชีก่อน
+            if not auto_owner or auto_owner == "ไม่ระบุ":
+                data = json.loads(json_bytes.decode('utf-8'))
+                lines = data.get('text', '').split('\n')
+                ext_owner, ext_acc = extract_account_info_from_json(lines)
+                if ext_owner != "ไม่ระบุ": auto_owner = ext_owner
+                if ext_acc != "ไม่ระบุ": auto_acc_no = ext_acc
+            
+            # 2. ประมวลผลธุรกรรม
+            df_part = parse_json_to_df(json_bytes, f.name)
             all_df.append(df_part)
         except Exception as e:
             st.error(f"เกิดข้อผิดพลาดในการอ่านไฟล์ {f.name}: {e}")
@@ -464,13 +507,17 @@ if process_btn:
     final_df = pd.concat(all_df, ignore_index=True)
     final_df["ลำดับ"] = range(1, len(final_df) + 1)
     
-    df_account = pd.DataFrame([{"เจ้าของบัญชี": owner_name, "เลขที่บัญชีเงินฝาก": account_no}])
-    excel_bytes = build_output_excel(df_account, final_df, owner_name, account_no)
+    # เลือกชื่อที่จะนำไปใช้ (ลำดับความสำคัญ: ผู้ใช้พิมพ์เอง > โปรแกรมหาเจอ > "ไม่ระบุ")
+    final_owner = owner_name if (owner_name and owner_name.strip() != "") else (auto_owner if auto_owner else "ไม่ระบุ")
+    final_acc_no = account_no if (account_no and account_no.strip() != "") else (auto_acc_no if auto_acc_no else "ไม่ระบุ")
+    
+    df_account = pd.DataFrame([{"เจ้าของบัญชี": final_owner, "เลขที่บัญชีเงินฝาก": final_acc_no}])
+    excel_bytes = build_output_excel(df_account, final_df, final_owner, final_acc_no)
     
     st.session_state["result_df"] = final_df
     st.session_state["excel_bytes"] = excel_bytes
-    st.session_state["owner_name"] = owner_name
-    st.session_state["account_no"] = account_no
+    st.session_state["owner_name"] = final_owner
+    st.session_state["account_no"] = final_acc_no
 
 if "result_df" in st.session_state:
     df = st.session_state["result_df"]
@@ -491,7 +538,7 @@ if "result_df" in st.session_state:
 
     st.divider()
     st.download_button(
-        label="📥 ดาวน์โหลดไฟล์ Excel (ครบ 4 ชีท)",
+        label="📥 ดาวน์โหลดไฟล์ Excel (ครบ 4 ชีท + สรุปเงินเดือน)",
         data=st.session_state["excel_bytes"],
         file_name=f"Statement_{st.session_state['owner_name']}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
