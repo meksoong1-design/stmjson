@@ -1084,8 +1084,10 @@ def main_app():
                 def _parse_date_safe(d):
                     try:   return datetime.strptime(str(d), "%d/%m/%Y")
                     except: return datetime.max
-                final_df["_sort_date"] = final_df["วันที่เดือนปี"].apply(_parse_date_safe)
-                final_df = final_df.sort_values(["_sort_date", final_df.index.to_series()], kind="stable").drop(columns=["_sort_date"]).reset_index(drop=True)
+                final_df = final_df.reset_index(drop=True)
+                final_df["_sort_date"]  = final_df["วันที่เดือนปี"].apply(_parse_date_safe)
+                final_df["_row_order"]  = final_df.index
+                final_df = final_df.sort_values(["_sort_date", "_row_order"], kind="stable").drop(columns=["_sort_date", "_row_order"]).reset_index(drop=True)
             final_df["ลำดับ"] = range(1, len(final_df)+1)
             check_df = (pd.concat(all_check, ignore_index=True)
                         if all_check else pd.DataFrame())
