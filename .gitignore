@@ -1,42 +1,51 @@
-# Environments
-.env
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-
-# Streamlit secrets (ถ้ามีการตั้งรหัสผ่านในอนาคต)
-.streamlit/secrets.toml
-
-# Python cache files
+# Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
+*.pyo
+*.pyd
+.Python
 
-# Jupyter Notebook (ถ้ามีการทดสอบโค้ด)
-.ipynb_checkpoints
+# Virtual environment
+venv/
+.env/
+.venv/
 
-# OS generated files
-.DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Thumbs.db
+# Environment variables
+.env
+.env.*
+!.env.example
 
-# -------------------------------------------------------------
-# 🔒 SECURE DATA (สำคัญมาก ห้ามเอาขึ้น Git เด็ดขาด!)
-# -------------------------------------------------------------
-# Data files & User Uploads
-*.json
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# Google service account keys
+*service-account*.json
+*credentials*.json
+*key*.json
+google-credentials.json
+gcp-credentials.json
+
+# Output files
 *.xlsx
 *.xls
 *.csv
-*.pdf
+document.json
+output.xlsx
+output_*.xlsx
+stm_result_*.xlsx
+stm_documentai_*.xlsx
 
-# ยกเว้นโฟลเดอร์สำหรับไฟล์ตัวอย่าง (ถ้ามีให้เพิ่ม ! ข้างหน้า)
-# !sample_data/*.json
+# Uploaded / temp files
+uploads/
+temp/
+tmp/
+*.tmp
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Jupyter
+.ipynb_checkpoints/
