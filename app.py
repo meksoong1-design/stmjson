@@ -1,552 +1,1029 @@
 # ============================================================
-# JSON Bank Statement Parser - Streamlit Edition (Full Version)
-# รองรับการอัปโหลดไฟล์ document.json จาก Document AI / OCR
-# ระบบอัตโนมัติ: ดึงชื่อ/เลขบัญชี, แยกเดบิต/เครดิต, หาเงินเดือน
+# STM Document AI to Excel Parser — Streamlit Edition
+# JPG / PNG / PDF -> Google Document AI -> Excel
 # ============================================================
+
+import io
+import os
+import re
+import json
+import math
+from datetime import datetime
 
 import streamlit as st
 import pandas as pd
-import json
-import re
-import tempfile
-import os
-from datetime import datetime
+
+from google.api_core.client_options import ClientOptions
+from google.cloud import documentai_v1 as documentai
+from google.oauth2 import service_account
+from google.protobuf.json_format import MessageToDict
+
 from openpyxl import load_workbook
-from openpyxl.styles import Alignment, Font, Border, Side, PatternFill
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.formatting.rule import FormulaRule
+from openpyxl.utils import get_column_letter
+
 
 # ============================================================
-# 1. CORE HELPERS & EXCEL FORMATTING
+# 0) Page Config
 # ============================================================
-def clean_text(value):
-    if value is None: return ""
-    return re.sub(r"\s+", " ", str(value).replace("\x00", " ").strip())
-
-def estimate_text_width(value):
-    text = clean_text(value)
-    if not text: return 0
-    w = 0.0
-    for ch in text:
-        if "\u0e00" <= ch <= "\u0e7f": w += 1.4
-        elif ch.isupper(): w += 1.1
-        elif ch.isdigit() or ch in ".,:-/()": w += 0.85
-        elif ch == " ": w += 0.4
-        else: w += 0.95
-    return w
-
-def auto_fit_worksheet(ws):
-    ws.freeze_panes = "A2"
-    thin = Side(style="thin", color="D9D9D9")
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
-    headers = {c: clean_text(ws.cell(row=1, column=c).value) for c in range(1, ws.max_column + 1)}
-
-    for row in ws.iter_rows():
-        for cell in row:
-            cell.border = border
-            cell.alignment = Alignment(vertical="center", wrap_text=False)
-            if cell.row == 1:
-                cell.font = Font(bold=True)
-                cell.alignment = Alignment(horizontal="center", vertical="center")
-            if isinstance(cell.value, (int, float)):
-                cell.number_format = "#,##0.00"
-                cell.alignment = Alignment(horizontal="right", vertical="center")
-
-    for col_cells in ws.columns:
-        letter = col_cells[0].column_letter
-        col_idx = col_cells[0].column
-        measured_w = estimate_text_width(headers.get(col_idx, ""))
-        for cell in col_cells:
-            if cell.value is not None:
-                parts = str(cell.value).splitlines() or [str(cell.value)]
-                measured_w = max(measured_w, max(estimate_text_width(p) for p in parts))
-        ws.column_dimensions[letter].width = max(8, min(measured_w + 1.5, 40))
-
-    for row_idx in range(1, ws.max_row + 1):
-        ws.row_dimensions[row_idx].height = 18 if row_idx > 1 else 22
-
-def format_summary_sheet(ws):
-    ws.sheet_view.showGridLines = False
-    ws.freeze_panes = "A2"
-    ws.column_dimensions["A"].width = 34
-    ws.column_dimensions["B"].width = 24
-
-    header_fill = PatternFill("solid", fgColor="1F4E79")
-    section_fill = PatternFill("solid", fgColor="DDEBF7")
-    sub_fill = PatternFill("solid", fgColor="EAF4EA")
-    blank_fill = PatternFill("solid", fgColor="FFFFFF")
-    thin = Side(style="thin", color="D9D9D9")
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
-
-    for cell in ws[1]:
-        cell.fill, cell.font, cell.border = header_fill, Font(bold=True, color="FFFFFF"), border
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-    ws.row_dimensions[1].height = 24
-
-    for row_idx in range(2, ws.max_row + 1):
-        label = clean_text(ws.cell(row=row_idx, column=1).value)
-        value_cell = ws.cell(row=row_idx, column=2)
-        for col in range(1, 3):
-            cell = ws.cell(row=row_idx, column=col)
-            cell.border, cell.alignment = border, Alignment(vertical="center", wrap_text=False)
-
-        if not label:
-            ws.row_dimensions[row_idx].height = 8
-            for col in range(1, 3): ws.cell(row=row_idx, column=col).fill = blank_fill
-            continue
-
-        if label == "หมวดหมู่รายได้":
-            for col in range(1, 3):
-                cell = ws.cell(row=row_idx, column=col)
-                cell.fill, cell.font, cell.alignment = section_fill, Font(bold=True), Alignment(horizontal="center", vertical="center")
-            ws.row_dimensions[row_idx].height = 22
-            continue
-
-        if any(k in label for k in ["สถานะ", "จำนวนรายการ", "ยอดรวม", "ค่าเฉลี่ยต่อเดือน", "เดือนที่ใช้คำนวณ"]):
-            ws.cell(row=row_idx, column=1).fill = ws.cell(row=row_idx, column=2).fill = sub_fill
-            ws.cell(row=row_idx, column=1).font = Font(bold=True)
-
-        if " - รายการที่ " in label:
-            ws.cell(row=row_idx, column=1).font = Font(bold=False)
-            value_cell.number_format = "dd/mm/yyyy"
-        elif label.endswith(" - ยอด") or isinstance(value_cell.value, (int, float)):
-            value_cell.number_format = "#,##0.00"
-            value_cell.alignment = Alignment(horizontal="right", vertical="center")
-
-def format_workbook_no_color(path):
-    wb = load_workbook(path)
-    for ws in wb.worksheets:
-        if ws.title != "BANK STATEMENT 1":
-            auto_fit_worksheet(ws)
-            if ws.title == "สรุปยอด": format_summary_sheet(ws)
-    wb.save(path)
-
-# ============================================================
-# 2. SALARY DETECTION & SUMMARY LOGIC
-# ============================================================
-def detect_salary_from_df(df_txn):
-    if df_txn.empty: return pd.DataFrame()
-    
-    salary_kws = ["SALARY", "PAYROLL", "SALA", "PAYR", "เงินเดือน", "เงินเดือนหลัก", "SAL"]
-    bonus_kws = ["BONUS", "INCENTIVE", "COMMISSION", "โบนัส", "อินเซนทีฟ", "ค่าคอม"]
-    income_records = []
-    
-    for _, row in df_txn.iterrows():
-        credit = float(row.get("เครดิต", 0))
-        if credit > 0:
-            desc = str(row.get("รายละเอียด", "")).upper()
-            is_bonus = any(kw in desc for kw in bonus_kws)
-            is_salary = any(kw in desc for kw in salary_kws)
-            
-            if is_bonus:
-                income_records.append({"กลุ่ม": "รายได้พิเศษ/โบนัส", "วันที่": row["วันที่เดือนปี"], "จำนวนเงิน": credit})
-            elif is_salary:
-                income_records.append({"กลุ่ม": "เงินเดือน", "วันที่": row["วันที่เดือนปี"], "จำนวนเงิน": credit})
-                
-    return pd.DataFrame(income_records)
-
-def build_summary_df(df_txn, owner, acc_no, bank_name="JSON Data"):
-    if df_txn.empty:
-        last_bal, s_date, e_date = 0.0, "", ""
-    else:
-        valid = df_txn["ยอดคงเหลือ"].dropna()
-        last_bal = float(valid.iloc[-1]) if len(valid) else 0.0
-        s_date = df_txn["วันที่เดือนปี"].iloc[0]
-        e_date = df_txn["วันที่เดือนปี"].iloc[-1]
-
-    rows = [
-        {"รายการ": "เจ้าของบัญชี", "ข้อมูล": owner},
-        {"รายการ": "เลขที่บัญชีเงินฝาก", "ข้อมูล": acc_no},
-        {"รายการ": "ธนาคาร", "ข้อมูล": bank_name},
-        {"รายการ": "จำนวนรายการ", "ข้อมูล": len(df_txn)},
-        {"รายการ": "รวมเดบิต", "ข้อมูล": float(df_txn["เดบิต"].sum()) if not df_txn.empty else 0.0},
-        {"รายการ": "รวมเครดิต", "ข้อมูล": float(df_txn["เครดิต"].sum()) if not df_txn.empty else 0.0},
-        {"รายการ": "ยอดคงเหลือล่าสุด", "ข้อมูล": last_bal},
-        {"รายการ": "วันที่เริ่มต้น", "ข้อมูล": s_date},
-        {"รายการ": "วันที่สิ้นสุด", "ข้อมูล": e_date},
-    ]
-
-    df_income = detect_salary_from_df(df_txn)
-    for group_name in ["เงินเดือน", "รายได้พิเศษ/โบนัส"]:
-        rows.append({"รายการ": "หมวดหมู่รายได้", "ข้อมูล": group_name})
-        if not df_income.empty and group_name in df_income["กลุ่ม"].values:
-            group_data = df_income[df_income["กลุ่ม"] == group_name].copy()
-            total_amt = float(group_data["จำนวนเงิน"].sum())
-            rows.extend([
-                {"รายการ": f"{group_name} - สถานะ", "ข้อมูล": "พบ"},
-                {"รายการ": f"{group_name} - จำนวนรายการ", "ข้อมูล": len(group_data)},
-                {"รายการ": f"{group_name} - ยอดรวม", "ข้อมูล": total_amt},
-                {"รายการ": f"{group_name} - ค่าเฉลี่ยต่อเดือน", "ข้อมูล": total_amt / len(group_data)},
-            ])
-            for idx, r in enumerate(group_data.itertuples(), start=1):
-                rows.append({"รายการ": f"{group_name} - รายการที่ {idx}", "ข้อมูล": r.วันที่})
-                rows.append({"รายการ": f"{group_name} - ยอด", "ข้อมูล": r.จำนวนเงิน})
-        else:
-            rows.extend([
-                {"รายการ": f"{group_name} - สถานะ", "ข้อมูล": "ไม่พบ"},
-                {"รายการ": f"{group_name} - จำนวนรายการ", "ข้อมูล": 0},
-                {"รายการ": f"{group_name} - ยอดรวม", "ข้อมูล": 0.0},
-            ])
-        rows.append({"รายการ": "", "ข้อมูล": ""})
-
-    rows.append({"รายการ": "สร้างไฟล์เมื่อ", "ข้อมูล": datetime.now().strftime("%d/%m/%Y %H:%M:%S")})
-    return pd.DataFrame(rows)
-
-# ============================================================
-# 3. BANK STATEMENT 1 LOGIC
-# ============================================================
-def calculate_30day_statement_logic(df_txn, period_days=30, periods=3):
-    empty_result = {"daily": pd.DataFrame(columns=["วันที่", "ยอดคงเหลือสิ้นวัน", "ช่วงที่"]), "blocks": []}
-    if df_txn.empty: return empty_result
-
-    work = df_txn.copy()
-    work["_date"] = pd.to_datetime(work["วันที่เดือนปี"].apply(lambda x: str(x).replace("-","/")), dayfirst=True, errors="coerce")
-    work = work.dropna(subset=["_date"])
-    if work.empty: return empty_result
-
-    work["ยอดคงเหลือ"] = pd.to_numeric(work["ยอดคงเหลือ"], errors="coerce").fillna(0.0)
-    work["_row_order"] = range(len(work))
-    work = work.sort_values(["_date", "_row_order"]).reset_index(drop=True)
-    work["_day"] = work["_date"].dt.normalize()
-
-    daily_txn = work.groupby("_day", as_index=True).agg(**{"ยอดคงเหลือสิ้นวัน": ("ยอดคงเหลือ", "last")}).sort_index()
-    full_days = pd.date_range(start=daily_txn.index.min(), end=daily_txn.index.max(), freq="D")
-    
-    daily = daily_txn.reindex(full_days)
-    daily["ยอดคงเหลือสิ้นวัน"] = daily["ยอดคงเหลือสิ้นวัน"].ffill().fillna(0.0)
-    daily = daily.tail(period_days * periods).copy().reset_index().rename(columns={"index": "วันที่"})
-    
-    daily["ลำดับ"] = range(1, len(daily) + 1)
-    daily["ช่วงที่"] = ((daily["ลำดับ"] - 1) // period_days) + 1
-
-    blocks = []
-    for block_no in range(1, periods + 1):
-        block = daily[daily["ช่วงที่"] == block_no].copy()
-        blocks.append({
-            "ช่วงที่": block_no, "จำนวนวัน": len(block),
-            "ผลรวม": float(block["ยอดคงเหลือสิ้นวัน"].sum()) if len(block) else 0.0,
-            "ค่าเฉลี่ย": float(block["ยอดคงเหลือสิ้นวัน"].mean()) if len(block) else 0.0,
-            "data": block,
-        })
-
-    daily_display = daily.copy()
-    daily_display["วันที่"] = daily_display["วันที่"].dt.strftime("%d/%m/%Y")
-    return {"daily": daily_display[["วันที่", "ยอดคงเหลือสิ้นวัน", "ช่วงที่"]], "blocks": blocks}
-
-def add_bank_statement_logic_sheet(path, df_txn, owner, acc_no, bank_name="JSON Data"):
-    result = calculate_30day_statement_logic(df_txn)
-    blocks = result["blocks"]
-    wb = load_workbook(path)
-    ws = wb.create_sheet("BANK STATEMENT 1")
-
-    title_blue = PatternFill("solid", fgColor="6FA1E8")
-    header_blue = PatternFill("solid", fgColor="A9C4F5")
-    light_blue = PatternFill("solid", fgColor="DDEBF7")
-    yellow = PatternFill("solid", fgColor="FFFF00")
-    gray = PatternFill("solid", fgColor="D9D9D9")
-    
-    normal_border = Border(left=Side(style="thin", color="000000"), right=Side(style="thin", color="000000"), top=Side(style="thin", color="000000"), bottom=Side(style="thin", color="000000"))
-    heavy_border = Border(left=Side(style="medium", color="000000"), right=Side(style="medium", color="000000"), top=Side(style="medium", color="000000"), bottom=Side(style="medium", color="000000"))
-    data_border = Border(left=Side(style="thin", color="D9D9D9"), right=Side(style="thin", color="D9D9D9"), top=Side(style="thin", color="D9D9D9"), bottom=Side(style="thin", color="D9D9D9"))
-
-    ws.merge_cells("A1:I1")
-    ws["A1"] = "BANK STATEMENT 1"
-    ws["A1"].font, ws["A1"].alignment, ws["A1"].fill = Font(bold=True, size=13), Alignment(horizontal="center", vertical="center"), title_blue
-
-    for idx in range(3):
-        r = 2 + idx
-        ws.cell(row=r, column=1, value=1)
-        ws.cell(row=r, column=2, value=f"เดือนที่ {idx + 1}")
-        ws.cell(row=r, column=3, value=f"=ROUND({['C37','F37','I37'][idx]},2)")
-
-    ws.cell(row=2, column=5, value="เฉลี่ยต่อเดือน")
-    ws.cell(row=2, column=6, value="=IF((C39>0)+(F39>0)+(I39>0)=0,0,ROUND((IF(C39>0,C37,0)+IF(F39>0,F37,0)+IF(I39>0,I37,0))/((C39>0)+(F39>0)+(I39>0)),2))")
-    ws.cell(row=3, column=5, value="จำนวนวันรวม")
-    ws.cell(row=3, column=6, value="=SUM(C39,F39,I39)")
-    ws.cell(row=4, column=5, value="ประเมินวงเงินได้")
-    ws.cell(row=4, column=6, value="=ROUND(F2*G3*G4,2)")
-
-    ws.merge_cells("H2:I2")
-    ws["H2"] = "Account Detail"
-    ws.cell(row=3, column=8, value="ธนาคาร")
-    ws.cell(row=3, column=9, value="เลขที่บัญชี")
-    ws.cell(row=4, column=8, value=bank_name)
-    ws.cell(row=4, column=9, value=acc_no)
-
-    for row in range(2, 5):
-        for col in range(1, 10):
-            cell = ws.cell(row=row, column=col)
-            cell.fill, cell.border, cell.font = header_blue, heavy_border, Font(bold=True)
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-    
-    for addr in ["C2", "C3", "C4", "F2", "F3"]: ws[addr].fill = light_blue
-
-    block_start_cols = [1, 4, 7]
-    for idx, block in enumerate(blocks):
-        start_col = block_start_cols[idx]
-        n_col, date_col, amount_col = start_col, start_col + 1, start_col + 2
-
-        for col, value in [(n_col, "N"), (date_col, "DATE"), (amount_col, "AMOUNT")]:
-            cell = ws.cell(row=5, column=col, value=value)
-            cell.fill, cell.font, cell.border, cell.alignment = header_blue, Font(bold=True), heavy_border, Alignment(horizontal="center", vertical="center")
-
-        data = block.get("data", pd.DataFrame())
-        for i in range(1, 31):
-            excel_row = 6 + i - 1
-            ws.cell(row=excel_row, column=n_col, value=i).fill = light_blue
-            ws.cell(row=excel_row, column=date_col).fill = light_blue
-
-            if i <= len(data):
-                row = data.iloc[i - 1]
-                date_val = row.get("วันที่", "")
-                if hasattr(date_val, "to_pydatetime"): date_val = date_val.to_pydatetime()
-                amt_val = float(row.get("ยอดคงเหลือสิ้นวัน", 0))
-                ws.cell(row=excel_row, column=date_col, value=date_val)
-                ws.cell(row=excel_row, column=amount_col, value=amt_val)
-                if i > 1 and round(amt_val, 2) != round(float(data.iloc[i - 2].get("ยอดคงเหลือสิ้นวัน", 0)), 2):
-                    ws.cell(row=excel_row, column=date_col).fill = yellow
-                    ws.cell(row=excel_row, column=amount_col).fill = yellow
-            for col in [n_col, date_col, amount_col]:
-                cell = ws.cell(row=excel_row, column=col)
-                cell.border, cell.alignment = data_border, Alignment(horizontal="center" if col != amount_col else "right", vertical="center")
-            ws.cell(row=excel_row, column=date_col).number_format = "d mmm yy"
-            ws.cell(row=excel_row, column=amount_col).number_format = "#,##0.00"
-
-        amt_let = ws.cell(row=5, column=amount_col).column_letter
-        ws.cell(row=36, column=n_col, value="รวม")
-        ws.cell(row=36, column=amount_col, value=f"=SUM({amt_let}6:{amt_let}35)")
-        ws.cell(row=37, column=amount_col, value=f"=IF({amt_let}39=0,0,{amt_let}36/{amt_let}39)")
-        ws.cell(row=38, column=amount_col, value="จำนวนวัน")
-        ws.cell(row=39, column=amount_col, value=f"=COUNT({amt_let}6:{amt_let}35)")
-        for row in range(36, 40):
-            for col in [n_col, date_col, amount_col]:
-                cell = ws.cell(row=row, column=col)
-                cell.border, cell.alignment = heavy_border, Alignment(horizontal="center" if col != amount_col else "right", vertical="center")
-                if col == amount_col: cell.number_format = "#,##0.00"
-        ws.cell(row=38, column=amount_col).fill = gray
-        ws.cell(row=38, column=amount_col).font = Font(bold=True)
-
-    ws.sheet_view.showGridLines = False
-    ws.freeze_panes = "A5"
-    for letter, width in {"A": 5, "B": 14, "C": 16, "D": 5, "E": 14, "F": 16, "G": 5, "H": 14, "I": 16}.items():
-        ws.column_dimensions[letter].width = width
-    for addr in ["C2", "C3", "C4", "F2", "F3", "F4"]: ws[addr].number_format = "#,##0.00"
-    wb.save(path)
-
-# ============================================================
-# 4. JSON PARSER LOGIC
-# ============================================================
-def extract_account_info_from_json(lines):
-    owner_name, account_no = "", ""
-    for i, line in enumerate(lines[:30]):
-        line = line.strip()
-        if not line: continue
-        
-        # 1. ค้นหา "ชื่อบัญชี"
-        if not owner_name:
-            if re.search(r'(ชื่อบัญชี|Account Name|ชื่อ\s*-\s*นามสกุล)', line, re.IGNORECASE):
-                owner_name = re.sub(r'^(.*?)(ชื่อบัญชี|Account\s*Name|ชื่อ\s*-\s*นามสกุล)\s*[:：]?\s*', '', line, flags=re.IGNORECASE).strip()
-                if not owner_name and i + 1 < len(lines):
-                    owner_name = lines[i+1].strip()
-            elif re.match(r'^(นาย|นาง|น\.ส\.|นางสาว|MR\.|MRS\.|MS\.)\s+', line, re.IGNORECASE):
-                owner_name = line
-                
-        # 2. ค้นหา "เลขที่บัญชี"
-        if not account_no:
-            m = re.search(r'(\d{3}[- ]?\d{1}[- ]?\d{5}[- ]?\d{1}|\d{10,12})', line)
-            if m: account_no = m.group(1).replace(" ", "")
-
-    return owner_name if owner_name else "ไม่ระบุ", account_no if account_no else "ไม่ระบุ"
-
-def parse_json_to_df(json_bytes, filename):
-    data = json.loads(json_bytes.decode('utf-8'))
-    text = data.get('text', '')
-    lines = text.split('\n')
-
-    date_pattern = re.compile(r'^\d{1,2}-\d{1,2}-\d{2,4}$')
-    money_pattern = re.compile(r'\d{1,3}(?:,\d{3})*\.\d{2}')
-
-    transactions = []
-    current_tx = None
-
-    for line in lines:
-        line = line.strip()
-        if not line: continue
-        
-        if date_pattern.match(line):
-            if current_tx: transactions.append(current_tx)
-            current_tx = {'date': line, 'money_tokens': [], 'raw_text': []}
-        elif current_tx is not None:
-            current_tx['raw_text'].append(line)
-            moneys = money_pattern.findall(line)
-            for m in moneys:
-                current_tx['money_tokens'].append(float(m.replace(',', '')))
-
-    if current_tx: transactions.append(current_tx)
-
-    results = []
-    prev_balance = None
-    seq = 1
-
-    for tx in transactions:
-        date = tx['date']
-        tokens = tx['money_tokens']
-        raw_lines = " ".join(tx['raw_text'])
-        debit, credit, balance = 0.0, 0.0, 0.0
-        
-        if len(tokens) == 1:
-            balance = tokens[0]
-            prev_balance = balance
-        elif len(tokens) >= 2:
-            amount = tokens[0]
-            balance = tokens[-1]
-            if prev_balance is not None:
-                if abs(prev_balance - amount - balance) < 0.01: debit = amount
-                elif abs(prev_balance + amount - balance) < 0.01: credit = amount
-                else:
-                    if balance < prev_balance: debit = amount
-                    else: credit = amount
-            prev_balance = balance
-
-        desc = raw_lines
-        for m in money_pattern.findall(raw_lines):
-            desc = desc.replace(m, "")
-        desc = re.sub(r'\s+', ' ', desc).strip()
-        date_str = date.replace("-", "/")
-
-        results.append({
-            "ลำดับ": seq, "วันที่เดือนปี": date_str, "เวลา": "", "รายการ": desc[:50],
-            "เดบิต": debit if debit else 0.0, "เครดิต": credit if credit else 0.0,
-            "ยอดคงเหลือ": balance if balance else 0.0, "รายละเอียด": desc,
-            "ช่องทาง": "JSON Upload", "หน้า": 1, "ไฟล์ต้นฉบับ": filename
-        })
-        seq += 1
-
-    return pd.DataFrame(results)
-
-# ============================================================
-# 5. MASTER EXCEL BUILDER
-# ============================================================
-def build_output_excel(df_account, df_txn, owner, acc_no):
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
-        tmp_path = tmp.name
-
-    with pd.ExcelWriter(tmp_path, engine="openpyxl") as writer:
-        df_account.to_excel(writer, sheet_name="เจ้าของบัญชี", index=False)
-        df_txn.to_excel(writer, sheet_name="รายละเอียด เดบิต-เครดิต", index=False)
-        build_summary_df(df_txn, owner, acc_no).to_excel(writer, sheet_name="สรุปยอด", index=False)
-
-    add_bank_statement_logic_sheet(tmp_path, df_txn, owner, acc_no)
-    format_workbook_no_color(tmp_path)
-
-    with open(tmp_path, "rb") as f:
-        data = f.read()
-    os.unlink(tmp_path)
-    return data
-
-# ============================================================
-# 6. STREAMLIT UI
-# ============================================================
-st.set_page_config(page_title="JSON Bank Statement", layout="centered")
+st.set_page_config(
+    page_title="STM Document AI Parser",
+    layout="centered",
+    initial_sidebar_state="collapsed",
+)
 
 st.markdown("""
 <style>
-    .block-container { padding-top: 2rem; max-width: 980px; }
-    h1 { font-size: 2.4rem !important; font-weight: 800 !important; }
-    .section-title { display: flex; align-items: center; gap: 8px; font-weight: 800; font-size: 1.15rem; margin: 18px 0 10px 0; }
-    .section-title .step-number { display: inline-flex; align-items: center; justify-content: center; min-width: 30px; height: 30px; border-radius: 999px; background: #4c82fb; color: #ffffff; }
-    div[data-testid="stFileUploader"] section { border-radius: 10px; }
-    div[data-testid="stButton"] button { border-radius: 10px; font-weight: 700; }
-    div[data-testid="stDownloadButton"] button { border-radius: 10px; font-weight: 800; }
+.block-container {
+    padding-top: 2rem;
+    padding-bottom: 3rem;
+    max-width: 980px;
+}
+h1 {
+    font-size: 2.2rem !important;
+    font-weight: 800 !important;
+    letter-spacing: -0.5px;
+}
+.section-title {
+    font-weight: 800;
+    font-size: 1.1rem;
+    margin: 18px 0 8px 0;
+}
+div[data-testid="stButton"] button,
+div[data-testid="stDownloadButton"] button {
+    border-radius: 10px;
+    font-weight: 750;
+}
+div[data-testid="stAlert"] {
+    border-radius: 10px;
+}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("JSON Bank Statement Parser")
-st.caption("ดึงข้อมูลจากไฟล์ JSON อัตโนมัติ (ชื่อบัญชี, เงินเดือน, ธุรกรรม) พร้อมสร้าง Excel 4 ชีท")
-st.divider()
 
-st.markdown("""<div class="section-title"><span class="step-number">1</span><span class="step-text">ตรวจสอบ / แก้ไขข้อมูลบัญชี (ถ้าต้องการ)</span></div>""", unsafe_allow_html=True)
-st.info("💡 ระบบจะพยายามค้นหา ชื่อ และ เลขบัญชี ให้อัตโนมัติ แต่คุณสามารถกรอกดักไว้ก่อนได้")
-col1, col2 = st.columns(2)
-owner_name = col1.text_input("ชื่อเจ้าของบัญชี", placeholder="เว้นว่างไว้เพื่อให้ระบบหาอัตโนมัติ", value="")
-account_no = col2.text_input("เลขที่บัญชี", placeholder="เว้นว่างไว้เพื่อให้ระบบหาอัตโนมัติ", value="")
+# ============================================================
+# 1) Constants
+# ============================================================
+BALANCE_TOLERANCE = 0.05
+LOW_CONF_THRESHOLD = 0.75
 
-st.markdown("""<div class="section-title"><span class="step-number">2</span><span class="step-text">อัปโหลดไฟล์ JSON</span></div>""", unsafe_allow_html=True)
-uploaded_files = st.file_uploader("เลือกไฟล์ .json (อัปโหลดหลายไฟล์ได้)", type=["json"], accept_multiple_files=True)
+BANK_LABELS = {
+    "AUTO": "ตรวจจับอัตโนมัติ",
+    "KBANK": "กสิกรไทย",
+    "BBL": "กรุงเทพ",
+    "SCB": "ไทยพาณิชย์",
+    "KRUNGSRI": "กรุงศรี",
+}
 
-st.markdown("""<div class="section-title"><span class="step-number">3</span><span class="step-text">ประมวลผล</span></div>""", unsafe_allow_html=True)
-process_btn = st.button("เริ่มประมวลผล", type="primary", use_container_width=True)
+BANK_CONFIGS = {
+    "DEFAULT": {
+        "bank_keywords": [],
+        "opening_keywords": [
+            "ยอด ยก มา", "ยอดยกมา", "ยอด ยก", "ยก มา",
+            "BALANCE BROUGHT FORWARD", "BROUGHT FORWARD",
+            "BALANCE B/F", "B/F"
+        ],
+        "credit_keywords": [
+            "รับ โอน", "รับโอน", "ฝาก", "ฝาก เงินสด", "เงิน เข้า", "เงินเข้า",
+            "ดอกเบี้ย", "คืนเงิน", "CREDIT", "DEPOSIT", "TRANSFER IN",
+            "Internet/Mobile", "รับจาก"
+        ],
+        "debit_keywords": [
+            "โอน เงิน", "โอนเงิน", "ถอน", "ถอนเงิน", "หัก", "ชำระ",
+            "จ่าย", "ค่าธรรมเนียม", "DEBIT", "WITHDRAW", "PAYMENT",
+            "FEE", "TRANSFER OUT", "ATM"
+        ],
+    },
+    "KBANK": {
+        "bank_keywords": ["KASIKORN", "KBANK", "K PLUS", "กสิกร"],
+        "opening_keywords": ["ยอด ยก มา", "ยอดยกมา", "BROUGHT FORWARD"],
+        "credit_keywords": ["รับ โอน", "รับโอน", "ฝาก", "เงิน เข้า", "CREDIT", "DEPOSIT"],
+        "debit_keywords": ["โอน เงิน", "โอนเงิน", "ถอน", "จ่าย", "PAYMENT", "WITHDRAW", "FEE"],
+    },
+    "BBL": {
+        "bank_keywords": ["BANGKOK BANK", "BANGKOKBANK", "ธนาคารกรุงเทพ", "BBL"],
+        "opening_keywords": ["B/F", "BALANCE B/F", "BROUGHT FORWARD", "ยอดยกมา"],
+        "credit_keywords": ["TRF FR", "TRANSFER IN", "CREDIT", "DEPOSIT", "รับโอน", "ฝาก"],
+        "debit_keywords": ["TRF TO", "PMT", "CASH W/D", "WITHDRAW", "PAYMENT", "DEBIT", "FEE"],
+    },
+    "SCB": {
+        "bank_keywords": ["SCB", "ไทยพาณิชย์", "SIAM COMMERCIAL BANK"],
+        "opening_keywords": ["ยอดเงินคงเหลือยกมา", "BROUGHT FORWARD", "B/F"],
+        "credit_keywords": ["รับ โอน", "รับโอน", "ฝาก", "เงิน เข้า", "CREDIT", "DEPOSIT"],
+        "debit_keywords": ["โอน ไป", "โอนไป", "จ่าย", "ถอน", "PAYMENT", "WITHDRAW", "FEE"],
+    },
+    "KRUNGSRI": {
+        "bank_keywords": ["KRUNGSRI", "กรุงศรี", "AYUDHYA"],
+        "opening_keywords": ["ยอดยกมา", "BROUGHT FORWARD", "B/F"],
+        "credit_keywords": ["รับ โอน", "รับโอน", "ฝาก", "เงิน เข้า", "CREDIT", "DEPOSIT"],
+        "debit_keywords": ["โอน เงิน", "ถอน", "จ่าย", "PAYMENT", "WITHDRAW", "FEE"],
+    },
+}
 
-if process_btn:
-    if not uploaded_files:
-        st.warning("กรุณาอัปโหลดไฟล์ JSON ก่อนประมวลผล")
+
+# ============================================================
+# 2) Login
+# ============================================================
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+if "results" not in st.session_state:
+    st.session_state.results = None
+
+
+def login_page():
+    st.title("Login")
+    st.caption("กรุณาเข้าสู่ระบบก่อนใช้งาน")
+
+    password = st.text_input("Password", type="password")
+
+    if st.button("เข้าสู่ระบบ", type="primary", use_container_width=True):
+        correct_pw = st.secrets.get("APP_PASSWORD", "stm2025")
+        if password == correct_pw:
+            st.session_state.authenticated = True
+            st.rerun()
+        else:
+            st.error("รหัสผ่านไม่ถูกต้อง")
+
+    st.stop()
+
+
+# ============================================================
+# 3) Google Document AI Client
+# ============================================================
+def get_documentai_config():
+    try:
+        project_id = st.secrets["DOCUMENTAI_PROJECT_ID"]
+        location = st.secrets["DOCUMENTAI_LOCATION"]
+        processor_id = st.secrets["DOCUMENTAI_PROCESSOR_ID"]
+        return project_id, location, processor_id
+    except Exception as e:
+        st.error(f"ไม่พบค่า DOCUMENTAI_PROJECT_ID / LOCATION / PROCESSOR_ID ใน Secrets: {e}")
         st.stop()
-        
-    all_df = []
-    auto_owner = ""
-    auto_acc_no = ""
-    
-    for f in uploaded_files:
+
+
+def get_documentai_client():
+    if "gcp_service_account" not in st.secrets:
+        st.error("ไม่พบ [gcp_service_account] ใน Streamlit Secrets")
+        st.stop()
+
+    try:
+        info = dict(st.secrets["gcp_service_account"])
+
+        if "private_key" in info and isinstance(info["private_key"], str):
+            info["private_key"] = info["private_key"].replace("\\n", "\n")
+
+        creds = service_account.Credentials.from_service_account_info(
+            info,
+            scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        )
+
+    except Exception as e:
+        st.error(f"อ่าน [gcp_service_account] ไม่สำเร็จ: {e}")
+        st.stop()
+
+    project_id, location, processor_id = get_documentai_config()
+
+    opts = ClientOptions(
+        api_endpoint=f"{location}-documentai.googleapis.com"
+    )
+
+    client = documentai.DocumentProcessorServiceClient(
+        credentials=creds,
+        client_options=opts,
+    )
+
+    processor_name = client.processor_path(
+        project_id,
+        location,
+        processor_id,
+    )
+
+    return client, processor_name
+
+
+def get_mime_type(filename: str) -> str:
+    filename = filename.lower()
+
+    if filename.endswith(".pdf"):
+        return "application/pdf"
+    if filename.endswith(".jpg") or filename.endswith(".jpeg"):
+        return "image/jpeg"
+    if filename.endswith(".png"):
+        return "image/png"
+
+    raise ValueError("รองรับเฉพาะ PDF, JPG, JPEG, PNG")
+
+
+def process_uploaded_file_with_document_ai(uploaded_file):
+    client, processor_name = get_documentai_client()
+
+    file_bytes = uploaded_file.read()
+    uploaded_file.seek(0)
+
+    mime_type = get_mime_type(uploaded_file.name)
+
+    raw_document = documentai.RawDocument(
+        content=file_bytes,
+        mime_type=mime_type,
+    )
+
+    request = documentai.ProcessRequest(
+        name=processor_name,
+        raw_document=raw_document,
+    )
+
+    result = client.process_document(request=request)
+
+    return result.document
+
+
+def document_to_dict(document):
+    return MessageToDict(
+        document._pb,
+        preserving_proto_field_name=True,
+    )
+
+
+def document_to_json_bytes(document):
+    document_dict = document_to_dict(document)
+
+    json_text = json.dumps(
+        document_dict,
+        ensure_ascii=False,
+        indent=2,
+    )
+
+    return json_text.encode("utf-8")
+
+
+# ============================================================
+# 4) Text Helpers
+# ============================================================
+def clean_text(s: str) -> str:
+    s = str(s).replace("\n", " ")
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def normalize_amount_text(s: str) -> str:
+    s = str(s).strip()
+    s = re.sub(r"\s+", "", s)
+
+    ocr_map = {
+        "O": "0", "o": "0",
+        "I": "1", "l": "1", "|": "1",
+        "S": "5", "s": "5",
+        "B": "8",
+        "g": "9", "q": "9",
+        "Z": "2", "z": "2",
+    }
+
+    for c, d in ocr_map.items():
+        s = s.replace(c, d)
+
+    # OCR อ่าน 25,000.00 เป็น 25.000.00
+    if re.match(r"^\d{1,3}\.\d{3}\.\d{2}$", s):
+        parts = s.split(".")
+        s = parts[0] + "," + parts[1] + "." + parts[2]
+
+    # OCR อ่าน 25.000,00 แบบยุโรป
+    if re.match(r"^\d{1,3}\.\d{3},\d{2}$", s):
+        s = s.replace(".", "").replace(",", ".")
+
+    # OCR อ่าน 100,00
+    if re.match(r"^\d+,\d{2}$", s):
+        s = s.replace(",", ".")
+
+    return s
+
+
+def parse_money(s):
+    if s is None:
+        return None
+
+    s = normalize_amount_text(str(s))
+    s = re.sub(r"[^0-9,.\-]", "", s)
+
+    if not s:
+        return None
+
+    try:
+        return float(s.replace(",", ""))
+    except Exception:
+        return None
+
+
+def extract_money_values(text: str) -> list[float]:
+    """
+    หาเลขเงินจากทั้งบรรทัด ไม่จำเป็นต้องเป็นตัวเลขล้วน
+    เช่น 4,151.01 ATM a -> ได้ 4151.01
+    """
+
+    text = str(text)
+
+    ocr_map = {
+        "O": "0", "o": "0",
+        "I": "1", "l": "1", "|": "1",
+        "S": "5", "s": "5",
+        "B": "8",
+        "g": "9", "q": "9",
+        "Z": "2", "z": "2",
+    }
+
+    for c, d in ocr_map.items():
+        text = text.replace(c, d)
+
+    patterns = [
+        r"(?<!\d)-?\d{1,3}(?:,\d{3})+\.\d{2}(?!\d)",
+        r"(?<!\d)-?\d{1,3}(?:\.\d{3})+\.\d{2}(?!\d)",
+        r"(?<!\d)-?\d{1,3}(?:\.\d{3})+,\d{2}(?!\d)",
+        r"(?<!\d)-?\d+\.\d{2}(?!\d)",
+        r"(?<!\d)-?\d+,\d{2}(?!\d)",
+    ]
+
+    results = []
+
+    for pat in patterns:
+        matches = re.findall(pat, text)
+        for m in matches:
+            value = parse_money(m)
+            if value is not None:
+                results.append(value)
+
+    # ลบซ้ำแต่รักษาลำดับ
+    unique = []
+    for v in results:
+        if v not in unique:
+            unique.append(v)
+
+    return unique
+
+
+def fix_ocr_date(s: str) -> str:
+    s = str(s).strip()
+    s = s.replace("O", "0").replace("o", "0")
+    s = s.replace("I", "1").replace("l", "1")
+    s = s.replace(".", "-").replace("/", "-")
+    return s
+
+
+def normalize_date(s: str):
+    s = fix_ocr_date(s)
+
+    m1 = re.match(r"^(\d{1,2})[-](\d{1,2})[-](\d{2,4})$", s)
+    m2 = re.match(r"^(\d{1,2})[-](\d{1,2})$", s)
+
+    if m1:
+        day = int(m1.group(1))
+        month = int(m1.group(2))
+        year_raw = m1.group(3)
+
+        if len(year_raw) == 2:
+            year = 2000 + int(year_raw)
+        else:
+            year = int(year_raw)
+
+    elif m2:
+        day = int(m2.group(1))
+        month = int(m2.group(2))
+        year = datetime.now().year
+    else:
+        return None
+
+    try:
+        dt = datetime(year, month, day)
+        return dt.strftime("%d-%m-%Y")
+    except Exception:
+        return None
+
+
+def extract_date_from_line(line: str):
+    tokens = str(line).split()
+
+    for tok in tokens:
+        d = normalize_date(tok)
+        if d:
+            return d
+
+    return None
+
+
+def extract_time_from_line(line: str):
+    m = re.search(r"\b\d{1,2}:\d{2}(?::\d{2})?\b", str(line))
+    if m:
+        return m.group(0)
+    return None
+
+
+def get_config(bank: str):
+    return BANK_CONFIGS.get(bank, BANK_CONFIGS["DEFAULT"])
+
+
+def has_opening_text(text: str, bank: str = "DEFAULT") -> bool:
+    up = clean_text(text).upper()
+
+    for kw in get_config(bank).get("opening_keywords", []):
+        if kw.upper() in up:
+            return True
+
+    for kw in BANK_CONFIGS["DEFAULT"]["opening_keywords"]:
+        if kw.upper() in up:
+            return True
+
+    return False
+
+
+def classify_by_keyword(text: str, bank: str = "DEFAULT") -> str:
+    up = clean_text(text).upper()
+
+    for kw in get_config(bank).get("credit_keywords", []):
+        if kw.upper() in up:
+            return "credit"
+
+    for kw in get_config(bank).get("debit_keywords", []):
+        if kw.upper() in up:
+            return "debit"
+
+    for kw in BANK_CONFIGS["DEFAULT"]["credit_keywords"]:
+        if kw.upper() in up:
+            return "credit"
+
+    for kw in BANK_CONFIGS["DEFAULT"]["debit_keywords"]:
+        if kw.upper() in up:
+            return "debit"
+
+    return "unknown"
+
+
+def detect_bank(full_text: str) -> str:
+    text = clean_text(full_text).upper()
+
+    best_bank = "DEFAULT"
+    best_score = 0
+
+    for bank, cfg in BANK_CONFIGS.items():
+        if bank == "DEFAULT":
+            continue
+
+        score = 0
+
+        for kw in cfg.get("bank_keywords", []):
+            if kw.upper() in text:
+                score += 10
+
+        for kw in cfg.get("credit_keywords", []):
+            if kw.upper() in text:
+                score += 1
+
+        for kw in cfg.get("debit_keywords", []):
+            if kw.upper() in text:
+                score += 1
+
+        if score > best_score:
+            best_score = score
+            best_bank = bank
+
+    return best_bank
+
+
+# ============================================================
+# 5) Parse Document AI Text
+# ============================================================
+def parse_document_ai_text(raw_text: str, active_bank: str) -> pd.DataFrame:
+    """
+    แยกธุรกรรมจาก document.text
+    หลัก:
+    - เจอวันที่ = เริ่มรายการใหม่
+    - เก็บบรรทัดถัดไปจนกว่าจะเจอวันที่ใหม่
+    - หาเงินจากทั้งกลุ่มข้อความ
+    - เงินตัวแรก = amount
+    - เงินตัวท้าย = balance
+    """
+
+    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+
+    rows = []
+    current = None
+
+    for line in lines:
+        date = extract_date_from_line(line)
+
+        if date:
+            if current:
+                rows.append(current)
+
+            current = {
+                "date": date,
+                "time": extract_time_from_line(line),
+                "raw_lines": [line],
+            }
+        else:
+            if current:
+                current["raw_lines"].append(line)
+
+    if current:
+        rows.append(current)
+
+    parsed_rows = []
+
+    for idx, item in enumerate(rows, start=1):
+        text_block = " ".join(item["raw_lines"])
+        money_vals = extract_money_values(text_block)
+
+        is_opening = has_opening_text(text_block, active_bank)
+
+        amount = None
+        balance = None
+
+        if is_opening:
+            if money_vals:
+                balance = money_vals[-1]
+        else:
+            if len(money_vals) >= 2:
+                amount = money_vals[0]
+                balance = money_vals[-1]
+            elif len(money_vals) == 1:
+                amount = money_vals[0]
+
+        parsed_rows.append({
+            "seq": idx,
+            "date": item.get("date"),
+            "time": item.get("time"),
+            "amount": amount,
+            "balance": balance,
+            "money_tokens": " | ".join(f"{v:.2f}" for v in money_vals),
+            "raw_line_text": text_block,
+            "is_opening_balance": is_opening,
+        })
+
+    return pd.DataFrame(parsed_rows)
+
+
+# ============================================================
+# 6) Balance Chain / Debit Credit
+# ============================================================
+def is_valid_number(x) -> bool:
+    if x is None:
+        return False
+
+    try:
+        x = float(x)
+        return not math.isnan(x)
+    except Exception:
+        return False
+
+
+def amount_balance_match(prev_balance, amount, balance, tolerance=BALANCE_TOLERANCE):
+    if not all(is_valid_number(v) for v in [prev_balance, amount, balance]):
+        return None
+
+    prev_balance = float(prev_balance)
+    amount = float(amount)
+    balance = float(balance)
+
+    debit_expected = round(prev_balance - amount, 2)
+    credit_expected = round(prev_balance + amount, 2)
+
+    if abs(balance - debit_expected) <= tolerance:
+        return {
+            "type": "debit",
+            "expected_balance": debit_expected,
+            "diff": round(balance - debit_expected, 2),
+            "balance_check": "OK_DEBIT",
+        }
+
+    if abs(balance - credit_expected) <= tolerance:
+        return {
+            "type": "credit",
+            "expected_balance": credit_expected,
+            "diff": round(balance - credit_expected, 2),
+            "balance_check": "OK_CREDIT",
+        }
+
+    return None
+
+
+def suggest_from_balance(prev_balance, balance):
+    if not all(is_valid_number(v) for v in [prev_balance, balance]):
+        return None, None
+
+    diff = round(float(balance) - float(prev_balance), 2)
+
+    if diff > 0:
+        return abs(diff), "credit"
+
+    if diff < 0:
+        return abs(diff), "debit"
+
+    return 0.0, "zero"
+
+
+def add_debit_credit_check(parsed_lines: pd.DataFrame, active_bank: str):
+    check_rows = []
+    prev_balance = None
+
+    for _, row in parsed_lines.iterrows():
+        seq = row.get("seq")
+        date = row.get("date")
+        time = row.get("time")
+        amount = row.get("amount")
+        balance = row.get("balance")
+        raw = row.get("raw_line_text", "")
+        money_tokens = row.get("money_tokens", "")
+        is_opening = row.get("is_opening_balance", False)
+
+        debit = None
+        credit = None
+        expected_balance = None
+        diff = None
+        suggested_amount = None
+        suggested_type = None
+        balance_check = ""
+
+        if is_opening or has_opening_text(raw, active_bank):
+            balance_check = "OPENING_BALANCE"
+
+        else:
+            match = amount_balance_match(prev_balance, amount, balance)
+
+            if match:
+                expected_balance = match["expected_balance"]
+                diff = match["diff"]
+                balance_check = match["balance_check"]
+
+                if match["type"] == "debit":
+                    debit = amount
+                else:
+                    credit = amount
+
+            else:
+                # ถ้า OCR อ่าน amount ไม่ดี แต่ balance chain บอกได้
+                s_amount, s_type = suggest_from_balance(prev_balance, balance)
+
+                if s_amount is not None and s_type in ["debit", "credit"]:
+                    suggested_amount = s_amount
+                    suggested_type = s_type
+                    expected_balance = balance
+                    diff = 0.0
+
+                    kw_type = classify_by_keyword(raw, active_bank)
+
+                    if kw_type == s_type:
+                        balance_check = "SUGGEST_BY_BALANCE_AND_KEYWORD"
+                    else:
+                        balance_check = "SUGGEST_BY_BALANCE_REVIEW"
+
+                    if s_type == "debit":
+                        debit = s_amount
+                    else:
+                        credit = s_amount
+                else:
+                    balance_check = "CHAIN_BROKEN_REVIEW"
+
+        check_rows.append({
+            "seq": seq,
+            "date": date,
+            "time": time,
+            "debit": debit,
+            "credit": credit,
+            "balance": balance,
+            "prev_balance": prev_balance,
+            "amount_read": amount,
+            "suggested_amount": suggested_amount,
+            "suggested_type": suggested_type,
+            "expected_balance_py": expected_balance,
+            "diff_py": diff,
+            "money_tokens": money_tokens,
+            "raw_line_text": raw,
+            "balance_check": balance_check,
+        })
+
+        if is_valid_number(balance):
+            prev_balance = float(balance)
+
+    check_df = pd.DataFrame(check_rows)
+
+    parsed_df = check_df.copy()
+
+    parsed_df = parsed_df[
+        ~parsed_df["balance_check"].astype(str).str.contains("OPENING_BALANCE", na=False)
+    ].copy()
+
+    has_amount = (
+        parsed_df["debit"].apply(is_valid_number)
+        | parsed_df["credit"].apply(is_valid_number)
+    )
+
+    parsed_df = parsed_df[has_amount].copy()
+    parsed_df = parsed_df[["date", "debit", "credit", "balance"]].reset_index(drop=True)
+
+    return parsed_df, check_df
+
+
+# ============================================================
+# 7) Excel Export
+# ============================================================
+def create_summary_df(parsed_df: pd.DataFrame, check_df: pd.DataFrame, active_bank: str):
+    debit_total = pd.to_numeric(parsed_df.get("debit", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()
+    credit_total = pd.to_numeric(parsed_df.get("credit", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()
+
+    balance_series = pd.to_numeric(parsed_df.get("balance", pd.Series(dtype=float)), errors="coerce").dropna()
+    last_balance = float(balance_series.iloc[-1]) if len(balance_series) else 0.0
+
+    ok_count = 0
+    review_count = 0
+
+    if not check_df.empty and "balance_check" in check_df.columns:
+        ok_count = int(check_df["balance_check"].astype(str).str.contains("OK|SUGGEST", regex=True).sum())
+        review_count = int(check_df["balance_check"].astype(str).str.contains("REVIEW|BROKEN", regex=True).sum())
+
+    return pd.DataFrame([
+        ["detected_bank", active_bank],
+        ["transaction_rows", len(parsed_df)],
+        ["debit_total", float(debit_total)],
+        ["credit_total", float(credit_total)],
+        ["net_change", float(credit_total - debit_total)],
+        ["last_balance", last_balance],
+        ["ok_or_suggest_checks", ok_count],
+        ["review_rows", review_count],
+    ], columns=["metric", "value"])
+
+
+def create_excel(parsed_df, check_df, raw_text, document_json_bytes, active_bank) -> bytes:
+    buf = io.BytesIO()
+
+    summary_df = create_summary_df(parsed_df, check_df, active_bank)
+    raw_df = pd.DataFrame({"raw_text": [raw_text]})
+
+    review_df = check_df[
+        check_df["balance_check"].astype(str).str.contains("REVIEW|BROKEN", regex=True, na=False)
+    ].copy()
+
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        parsed_df.to_excel(writer, sheet_name="parsed_stm", index=False)
+        check_df.to_excel(writer, sheet_name="check", index=False)
+        summary_df.to_excel(writer, sheet_name="summary", index=False)
+        review_df.to_excel(writer, sheet_name="ocr_review", index=False)
+        raw_df.to_excel(writer, sheet_name="raw_text", index=False)
+
+    buf.seek(0)
+    wb = load_workbook(buf)
+
+    header_fill = PatternFill("solid", fgColor="D9EAF7")
+    header_font = Font(color="000000", bold=True)
+    thin = Side(style="thin", color="D9E2F3")
+
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = Border(bottom=thin)
+
+        ws.freeze_panes = "A2"
+
+        headers = {str(cell.value): cell.column for cell in ws[1] if cell.value}
+
+        for col_name in [
+            "debit", "credit", "balance", "prev_balance", "amount_read",
+            "suggested_amount", "expected_balance_py", "diff_py"
+        ]:
+            if col_name in headers:
+                col_idx = headers[col_name]
+                for row in range(2, ws.max_row + 1):
+                    ws.cell(row=row, column=col_idx).number_format = "#,##0.00"
+
+        for col_idx in range(1, ws.max_column + 1):
+            col_letter = get_column_letter(col_idx)
+            max_len = 0
+
+            for cell in ws[col_letter]:
+                value = str(cell.value) if cell.value is not None else ""
+                max_len = max(max_len, len(value))
+
+            ws.column_dimensions[col_letter].width = min(max(max_len + 2, 12), 55)
+
+    # Conditional formatting เฉพาะ sheet check
+    if "check" in wb.sheetnames:
+        ws = wb["check"]
+        headers = {str(cell.value): cell.column for cell in ws[1] if cell.value}
+
+        if "balance_check" in headers and ws.max_row >= 2:
+            reason_col = get_column_letter(headers["balance_check"])
+            red_fill = PatternFill("solid", fgColor="FCE4E4")
+            red_font = Font(color="9C0006")
+
+            ws.conditional_formatting.add(
+                f"A2:{get_column_letter(ws.max_column)}{ws.max_row}",
+                FormulaRule(
+                    formula=[f'=ISNUMBER(SEARCH("REVIEW",${reason_col}2))'],
+                    fill=red_fill,
+                    font=red_font,
+                ),
+            )
+
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+
+# ============================================================
+# 8) Main App
+# ============================================================
+def main_app():
+    st.title("STM Document AI Parser")
+    st.caption("JPG / PNG / PDF → Google Document AI → Excel")
+    st.divider()
+
+    st.markdown('<div class="section-title">1. เลือกธนาคาร</div>', unsafe_allow_html=True)
+
+    bank_choice = st.radio(
+        "ธนาคาร",
+        options=list(BANK_LABELS.keys()),
+        format_func=lambda x: BANK_LABELS[x],
+        index=0,
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+
+    st.markdown('<div class="section-title">2. อัปโหลด Statement</div>', unsafe_allow_html=True)
+
+    uploaded_file = st.file_uploader(
+        "เลือกไฟล์ JPG / PNG / PDF",
+        type=["jpg", "jpeg", "png", "pdf"],
+        accept_multiple_files=False,
+    )
+
+    col_a, col_b = st.columns(2)
+
+    with col_a:
+        process_clicked = st.button(
+            "เริ่มอ่านด้วย Document AI",
+            type="primary",
+            use_container_width=True,
+            disabled=uploaded_file is None,
+        )
+
+    with col_b:
+        if st.button("ออกจากระบบ", use_container_width=True):
+            st.session_state.authenticated = False
+            st.session_state.results = None
+            st.rerun()
+
+    if process_clicked and uploaded_file:
+        st.session_state.results = None
+
+        progress = st.progress(0, text="เริ่มประมวลผล...")
+        status = st.empty()
+
         try:
-            json_bytes = f.read()
-            # 1. ให้ระบบลองค้นหาชื่อบัญชีและเลขบัญชีก่อน
-            if not auto_owner or auto_owner == "ไม่ระบุ":
-                data = json.loads(json_bytes.decode('utf-8'))
-                lines = data.get('text', '').split('\n')
-                ext_owner, ext_acc = extract_account_info_from_json(lines)
-                if ext_owner != "ไม่ระบุ": auto_owner = ext_owner
-                if ext_acc != "ไม่ระบุ": auto_acc_no = ext_acc
-            
-            # 2. ประมวลผลธุรกรรม
-            df_part = parse_json_to_df(json_bytes, f.name)
-            all_df.append(df_part)
+            status.info("กำลังส่งไฟล์เข้า Google Document AI...")
+            progress.progress(20, text="20%")
+
+            document = process_uploaded_file_with_document_ai(uploaded_file)
+            raw_text = document.text or ""
+
+            if not raw_text.strip():
+                st.error("Document AI อ่านข้อความไม่เจอ")
+                st.stop()
+
+            document_json_bytes = document_to_json_bytes(document)
+
+            progress.progress(45, text="45%")
+            status.info("กำลังตรวจจับธนาคาร...")
+
+            active_bank = bank_choice
+            if bank_choice == "AUTO":
+                active_bank = detect_bank(raw_text)
+
+            progress.progress(60, text="60%")
+            status.info("กำลังแยกรายการธุรกรรม...")
+
+            parsed_lines = parse_document_ai_text(raw_text, active_bank)
+
+            progress.progress(75, text="75%")
+            status.info("กำลังคำนวณ debit / credit จาก balance chain...")
+
+            parsed_df, check_df = add_debit_credit_check(parsed_lines, active_bank)
+
+            progress.progress(90, text="90%")
+            status.info("กำลังสร้าง Excel...")
+
+            excel_bytes = create_excel(
+                parsed_df=parsed_df,
+                check_df=check_df,
+                raw_text=raw_text,
+                document_json_bytes=document_json_bytes,
+                active_bank=active_bank,
+            )
+
+            excel_name = f"stm_documentai_{active_bank.lower()}.xlsx"
+
+            st.session_state.results = {
+                "active_bank": active_bank,
+                "parsed_df": parsed_df,
+                "check_df": check_df,
+                "raw_text": raw_text,
+                "document_json_bytes": document_json_bytes,
+                "excel_bytes": excel_bytes,
+                "excel_name": excel_name,
+            }
+
+            progress.progress(100, text="เสร็จสิ้น ✅")
+            status.success(f"สำเร็จ พบ {len(parsed_df):,} รายการ · ธนาคาร: {active_bank}")
+
         except Exception as e:
-            st.error(f"เกิดข้อผิดพลาดในการอ่านไฟล์ {f.name}: {e}")
-            
-    if not all_df:
-        st.stop()
-        
-    final_df = pd.concat(all_df, ignore_index=True)
-    final_df["ลำดับ"] = range(1, len(final_df) + 1)
-    
-    # เลือกชื่อที่จะนำไปใช้ (ลำดับความสำคัญ: ผู้ใช้พิมพ์เอง > โปรแกรมหาเจอ > "ไม่ระบุ")
-    final_owner = owner_name if (owner_name and owner_name.strip() != "") else (auto_owner if auto_owner else "ไม่ระบุ")
-    final_acc_no = account_no if (account_no and account_no.strip() != "") else (auto_acc_no if auto_acc_no else "ไม่ระบุ")
-    
-    df_account = pd.DataFrame([{"เจ้าของบัญชี": final_owner, "เลขที่บัญชีเงินฝาก": final_acc_no}])
-    excel_bytes = build_output_excel(df_account, final_df, final_owner, final_acc_no)
-    
-    st.session_state["result_df"] = final_df
-    st.session_state["excel_bytes"] = excel_bytes
-    st.session_state["owner_name"] = final_owner
-    st.session_state["account_no"] = final_acc_no
+            progress.empty()
+            status.error(f"ประมวลผลไม่สำเร็จ: {e}")
+            st.exception(e)
 
-if "result_df" in st.session_state:
-    df = st.session_state["result_df"]
-    st.divider()
-    st.success(f"ประมวลผลสำเร็จ! พบ {len(df):,} รายการ")
-    
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("เจ้าของบัญชี", st.session_state["owner_name"])
-    c2.metric("จำนวนรายการ", f"{len(df):,}")
-    c3.metric("รวมเดบิต", f"{df['เดบิต'].sum():,.2f}")
-    c4.metric("รวมเครดิต", f"{df['เครดิต'].sum():,.2f}")
+    if st.session_state.results:
+        res = st.session_state.results
 
-    st.markdown("#### ตัวอย่างข้อมูลที่ประมวลผลได้ (30 รายการแรก)")
-    st.dataframe(
-        df.head(30).style.format({"เดบิต": "{:,.2f}", "เครดิต": "{:,.2f}", "ยอดคงเหลือ": "{:,.2f}"}),
-        use_container_width=True, height=400
-    )
+        st.divider()
+        st.success(f"ประมวลผลสำเร็จ พบ {len(res['parsed_df']):,} รายการ")
+        st.caption(f"ธนาคาร: {res['active_bank']}")
 
-    st.divider()
-    st.download_button(
-        label="📥 ดาวน์โหลดไฟล์ Excel (ครบ 4 ชีท + สรุปเงินเดือน)",
-        data=st.session_state["excel_bytes"],
-        file_name=f"Statement_{st.session_state['owner_name']}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-        type="primary"
-    )
-    
-    if st.button("ล้างข้อมูลหลังใช้งาน", use_container_width=True):
-        for key in ["result_df", "excel_bytes", "owner_name", "account_no"]:
-            if key in st.session_state: del st.session_state[key]
-        st.rerun()
+        parsed_df = res["parsed_df"]
+        check_df = res["check_df"]
+
+        debit_total = pd.to_numeric(parsed_df.get("debit", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()
+        credit_total = pd.to_numeric(parsed_df.get("credit", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()
+
+        balance_series = pd.to_numeric(parsed_df.get("balance", pd.Series(dtype=float)), errors="coerce").dropna()
+        last_balance = float(balance_series.iloc[-1]) if len(balance_series) else 0.0
+
+        ok_count = int(check_df["balance_check"].astype(str).str.contains("OK|SUGGEST", regex=True).sum()) if not check_df.empty else 0
+        review_count = int(check_df["balance_check"].astype(str).str.contains("REVIEW|BROKEN", regex=True).sum()) if not check_df.empty else 0
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("รายการ", f"{len(parsed_df):,}")
+        c2.metric("ยอดล่าสุด", f"{last_balance:,.2f}")
+        c3.metric("ผ่าน/เดาได้", f"{ok_count:,}")
+        c4.metric("ต้องตรวจ", f"{review_count:,}")
+
+        c5, c6, c7 = st.columns(3)
+        c5.metric("รวมเดบิต", f"{debit_total:,.2f}")
+        c6.metric("รวมเครดิต", f"{credit_total:,.2f}")
+        c7.metric("สุทธิ", f"{credit_total - debit_total:,.2f}")
+
+        st.download_button(
+            "ดาวน์โหลด Excel",
+            data=res["excel_bytes"],
+            file_name=res["excel_name"],
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+            use_container_width=True,
+        )
+
+        st.download_button(
+            "ดาวน์โหลด document.json",
+            data=res["document_json_bytes"],
+            file_name="document.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+
+        st.divider()
+
+        tab1, tab2, tab3 = st.tabs(["parsed_stm", "check", "raw_text"])
+
+        with tab1:
+            if parsed_df.empty:
+                st.warning("ไม่พบรายการธุรกรรม")
+            else:
+                show_df = parsed_df.copy()
+                for col in ["debit", "credit", "balance"]:
+                    show_df[col] = pd.to_numeric(show_df[col], errors="coerce")
+
+                st.dataframe(
+                    show_df.style.format({
+                        "debit": lambda v: f"{v:,.2f}" if pd.notna(v) else "",
+                        "credit": lambda v: f"{v:,.2f}" if pd.notna(v) else "",
+                        "balance": lambda v: f"{v:,.2f}" if pd.notna(v) else "",
+                    }),
+                    use_container_width=True,
+                    height=420,
+                )
+
+        with tab2:
+            st.dataframe(check_df, use_container_width=True, height=520)
+
+        with tab3:
+            st.text_area("ข้อความ OCR จาก Document AI", res["raw_text"], height=500)
+
+        if st.button("ล้างผลลัพธ์", use_container_width=True):
+            st.session_state.results = None
+            st.rerun()
+
+
+# ============================================================
+# 9) Entry Point
+# ============================================================
+if not st.session_state.authenticated:
+    login_page()
+else:
+    main_app()
